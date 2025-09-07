@@ -139,7 +139,7 @@ if __name__ == '__main__':
     '''
     datasets = load_dataset(
         "McAuley-Lab/Amazon-Reviews-2023",
-        f"0core_timestamp_w_his_{args.domain}",
+        f"5core_timestamp_w_his_{args.domain}",
         trust_remote_code=True
     )
     item2meta = process_meta(args)
