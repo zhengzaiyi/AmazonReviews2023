@@ -142,10 +142,10 @@ def initialize_recallers(model_names: List[str], dataset_name: str, checkpoint_d
     return recallers
 
 def main(argv: List[str] = None):
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description='GRPO Training for Recommendation Systems')
     ap.add_argument('--dataset', type=str, default='ml-100k')
     ap.add_argument('--data_path', type=str, default='./data')
-    ap.add_argument('--epochs', type=int, default=3)
+    ap.add_argument('--epochs', type=int, default=3, help='Number of training epochs')
     ap.add_argument('--users_per_batch', type=int, default=128)
     ap.add_argument('--group_size', type=int, default=4)
     ap.add_argument('--final_k', type=int, default=50)
@@ -153,11 +153,14 @@ def main(argv: List[str] = None):
     ap.add_argument('--recbole_models', type=str, nargs='+', default=['SASRec', 'BPR'])
     ap.add_argument('--checkpoint_dir', type=str, default='./checkpoints')
     ap.add_argument('--use_latest_checkpoint', action='store_true')
-    ap.add_argument('--router_only', action='store_true')
+    ap.add_argument('--router_only', action='store_true', help='Run in router-only mode')
+    ap.add_argument('--train_router', action='store_true', default=True, help='Train router using GRPO when in router_only mode (default: True)')
+    ap.add_argument('--eval_only', action='store_true', help='Only evaluate router without training (overrides --train_router)')
     ap.add_argument('--router_strategy', type=str, default='first', choices=['first','oracle'])
     ap.add_argument('--save_router_json', type=str, default='')
+    ap.add_argument('--router_batch_size', type=int, default=32, help='Batch size for router training')
     ap.add_argument('--use_hf_local', action='store_true')
-    ap.add_argument('--hf_model', type=str, default='meta-llama/Llama-3.1-8B-Instruct')
+    ap.add_argument('--hf_model', type=str, default='meta-llama/Llama-3.2-1B')
     ap.add_argument('--hf_dtype', type=str, default='auto')
     ap.add_argument('--hf_device', type=str, default='auto')
     ap.add_argument('--api_base', type=str, default='')
@@ -188,8 +191,56 @@ def main(argv: List[str] = None):
     if args.router_only:
         users = list(range(inter.num_users))
         save_path = args.save_router_json if args.save_router_json else None
-        res = run_router_only(users, inter.user2item_list_train, inter.user2items_test, profile_agent, router, recallers, final_k=args.final_k, group_size=args.group_size, strategy=args.router_strategy, save_router_json=save_path)
-        print(f"Done. Router-only avg Recall@{args.final_k} = {res['avg_recall']:.4f}")
+        
+        # Determine if we should train or just evaluate
+        should_train_router = args.train_router and not args.eval_only
+        
+        if should_train_router:
+            # Training mode for router
+            print("Training router using GRPO...")
+            
+            # Create trainer for router training (no selector needed in router-only mode)
+            trainer = GRPOTrainer(None, GRPOConfig(beta=1.0, group_size=args.group_size, lr=3e-4), router=router)
+            
+            for ep in range(args.epochs):
+                print(f"Epoch {ep+1}/{args.epochs}")
+                random.shuffle(users)
+                
+                res = run_router_only(
+                    users, 
+                    inter.user2item_list_train, 
+                    inter.user2items_test, 
+                    profile_agent, 
+                    router, 
+                    recallers, 
+                    final_k=args.final_k, 
+                    group_size=args.group_size, 
+                    strategy=args.router_strategy, 
+                    save_router_json=save_path,
+                    grpo_trainer=trainer,
+                    train_router=True,
+                    batch_size=args.router_batch_size
+                )
+                print(f"[Epoch {ep+1}] Router Training - Loss: {res.get('avg_loss', 0.0):.4f}, Avg Recall@{args.final_k}: {res['avg_recall']:.4f}")
+            
+            print(f"Done. Router training completed. Final avg Recall@{args.final_k} = {res['avg_recall']:.4f}")
+        else:
+            # Evaluation mode for router (original behavior)
+            print("Evaluating router (no training)...")
+            res = run_router_only(
+                users, 
+                inter.user2item_list_train, 
+                inter.user2items_test, 
+                profile_agent, 
+                router, 
+                recallers, 
+                final_k=args.final_k, 
+                group_size=args.group_size, 
+                strategy=args.router_strategy, 
+                save_router_json=save_path,
+                train_router=False
+            )
+            print(f"Done. Router-only evaluation avg Recall@{args.final_k} = {res['avg_recall']:.4f}")
         return
 
     selector = PreferenceSelectorNet(available_models=list(recallers.keys()))

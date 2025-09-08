@@ -264,7 +264,7 @@ class RecBoleRecaller(BaseRecaller):
                 hist_items = self.user2item_list_train.get(user_id, [])
                 if hist_items:
                     # Pad or truncate to max_seq_length if needed
-                    max_seq_len = self.config.get('max_seq_length', 50)
+                    max_seq_len = 50
                     if len(hist_items) > max_seq_len:
                         hist_items = hist_items[-max_seq_len:]
                     # Ensure proper tensor shape [batch_size, seq_len]
@@ -365,4 +365,3 @@ class RecBoleRecaller(BaseRecaller):
 
 # PopularityRecaller and ItemCFRecaller are now unified through RecBoleRecaller
 # Usage: RecBoleRecaller(model_name='Pop', ...) or RecBoleRecaller(model_name='ItemKNN', ...)
-# This ensures consistency and leverages RecBole's standardized implementations
