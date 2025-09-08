@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from GRPO.agents import LLMRouterAgent
 
 from .utils import recall_at_k, merge_candidates
 
@@ -85,7 +86,7 @@ class GRPOTrainer:
              histories: Dict[int, List[int]],
              user2items_test: Dict[int, List[int]],
              profile_agent,
-             router,
+             router: LLMRouterAgent,
              recallers: Dict[str, object],
              final_k: int = 50) -> Dict[str, float]:
         
