@@ -13,6 +13,28 @@ from GRPO.agents import LLMRouterAgent
 from .utils import recall_at_k, merge_candidates
 
 
+def generate_diverse_routes(router, prof_json, n_candidates, temperature=0.8):
+    """
+    生成 n 个不同的 routes，使用改进的批量去重策略
+    
+    Args:
+        router: 路由器对象 (LLMRouterAgent)
+        prof_json: 用户配置文件 JSON
+        n_candidates: 需要生成的路由数量
+        temperature: 采样温度，控制多样性
+    
+    Returns:
+        List[dict]: 不同的路由列表
+    """
+    # 使用改进的LLMRouterAgent的内置多样性生成功能
+    return router.forward(
+        prof_json, 
+        n_candidates=n_candidates, 
+        temperature=temperature, 
+        ensure_diversity=True
+    )
+
+
 class PreferenceSelectorNet(nn.Module):
     def __init__(self, available_models: List[str] = None):
         super().__init__()
@@ -26,7 +48,7 @@ class PreferenceSelectorNet(nn.Module):
 
     def encode_profile(self, profile: Dict) -> torch.Tensor:
         uid = torch.tensor([profile["uid"]], dtype=torch.long)
-        feats = torch.tensor([[profile["len_hist"], profile["last_item"], profile["pop_bias"]]], dtype=torch.float32)
+        feats = torch.tensor([[profile["len_hist"], profile["last_item"]]], dtype=torch.float32)
         h = torch.cat([self.uid_emb(uid), feats], dim=-1).squeeze(0)
         return self.mlp(h)
 
@@ -98,7 +120,7 @@ class GRPOTrainer:
             hist = histories.get(uid, [])
             prof_json = profile_agent.forward(uid, hist).profile_json
             profile = json.loads(prof_json)
-            routes = router.forward(prof_json, n_candidates=self.cfg.group_size)
+            routes = generate_diverse_routes(router, prof_json, n_candidates=self.cfg.group_size)
             if len(routes) < 2:
                 continue
             rewards = []
@@ -154,8 +176,8 @@ class GRPOTrainer:
             hist = histories.get(uid, [])
             prof_json = profile_agent.forward(uid, hist).profile_json
             
-            # Get routes from the trainable router
-            routes = self.router.forward(prof_json, n_candidates=self.cfg.group_size)
+            # Get routes from the trainable router using improved diversity generation
+            routes = generate_diverse_routes(self.router, prof_json, n_candidates=self.cfg.group_size)
             if len(routes) < 2:
                 continue
                 
@@ -283,7 +305,7 @@ def run_router_only(
         for uid in users:
             hist = histories.get(uid, [])
             prof_json = profile_agent.forward(uid, hist).profile_json
-            routes = router.forward(prof_json, n_candidates=group_size)
+            routes = generate_diverse_routes(router, prof_json, n_candidates=group_size)
             if save_router_json is not None:
                 routes_dump[str(uid)] = routes
             if not routes:

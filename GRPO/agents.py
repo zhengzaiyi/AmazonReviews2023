@@ -42,26 +42,23 @@ class HFLocalGenerator:
         
         # Create an example output format
         import random
-        example_output = [
-            {
-                "models": [
-                    {"name": available_models[i], "k": random.randint(1, 100), "weight": random.uniform(0, 1)} for i in range(min(2, len(available_models)))
-                ]
-            } for _ in range(n)
-        ]
+        example_output = [{
+            "name": available_models[i], 
+            "k": random.randint(1, 100), 
+            "weight": round(random.uniform(0, 1), 4)
+        } for i in range(min(2, len(available_models)))]
+
         
         example_json = json.dumps(example_output[:min(n, 2)], indent=2)
         
         return (
-            "You are a multi-channel recall assistant in a recommendation system. Given a user profile JSON and the number n of output routing strategies, "
-            "output ONLY a JSON array with length n. Each element must be an object with keys: "
-            "\"models\" (array: list of model objects, each with \"name\" (string: model name like '"
-            + models_str + "'), \"k\" (int 1..500: number of items), \"weight\" (float 0..1: model weight)), "
-            "where weights within each routing strategy should sum to 1.0.\n\n"
+            "You are a multi-channel recall assistant in a recommendation system. Given a user profile JSON, "
+            "output ONLY a JSON file describe the usage of different models during the multi-channel recall. Each element must be an object with keys: "
+            "\"name\" (string: model name like '"
+            + models_str + "'), \"k\" (int 1..500: number of items), \"weight\" (float 0..1: model weight)\n\n"
             f"Available models: {available_models}\n"
             f"Profile:\n{profile_json}\n"
-            f"n={n}\n\n"
-            f"Expected output format example:\n{example_json}\n\n"
+            # f"Expected output format example:\n{example_json}\n\n"
             "Your JSON response:"
         )
 
@@ -78,27 +75,48 @@ class HFLocalGenerator:
             return None
         return None
 
-    def generate(self, profile_json: str, n: int, available_models: List[str] = None) -> List[dict]:
+    def generate(self, profile_json: str, n: int, available_models: List[str] = None, 
+                 temperature: float = 0.8, top_k: int = 50, top_p: float = 0.9, 
+                 num_return_sequences: int = 1) -> List[dict]:
         prompt = self._build_prompt(profile_json, n, available_models)
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=512,  # Increased for more complex JSON
-                do_sample=False,
-                temperature=0.0,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-            )
-        text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        data = self._extract_json_array(text[len(prompt):])
-        return data if isinstance(data, list) else []
+        
+        all_routes = []
+        
+        for _ in range(num_return_sequences):
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=512,
+                    min_new_tokens=10,
+                    do_sample=True, 
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                )
+            text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)[len(prompt):]
+            if text[0] != "[":
+                text = "[" + text
+            if text[-1] != "]":
+                text = text + "]"
+            data = self._extract_json_array(text)
+            if isinstance(data, list):
+                all_routes.extend(data)
+        
+        return all_routes
 
 
 class UserProfileAgent:
     def __init__(self, num_items: int): self.num_items = num_items
     def forward(self, user_id: int, history: List[int]):
-        feats = {"uid": int(user_id), "len_hist": len(history), "last_item": int(history[-1]) if history else -1, "pop_bias": float(1.0 / (1.0 + math.exp(-(len(history) - 5))))}
+        feats = {
+            "uid": int(user_id), 
+            "len_hist": len(history), 
+            "last_item": int(history[-1]) if history else -1, 
+            # "pop_bias": float(1.0 / (1.0 + math.exp(-(len(history) - 5))))
+        }
         class _Out:
             def __init__(self, js): self.profile_json = js
         return _Out(json.dumps(feats))
@@ -110,15 +128,62 @@ class LLMRouterAgent:
         self.local_hf = local_hf
         self.available_models = available_models or ['sasrec', 'bpr', 'pop']
 
-    def forward(self, profile_json: str, n_candidates: int = None) -> List[dict]:
+    def _select_diverse_routes(self, candidate_routes: List[dict], n: int) -> List[dict]:
+        """
+        choose n different routes from candidate routes
+        """
+        if not candidate_routes:
+            return []
+        
+        unique_routes = []
+        seen_keys = set()
+        
+        for route in candidate_routes:
+            if "models" in route and isinstance(route["models"], list):
+                models_key = tuple(
+                    (m.get("name", ""), m.get("k", 0), round(float(m.get("weight", 0.0)), 3))
+                    for m in route["models"]
+                )
+                route_key = ("new_format", models_key)
+            else:
+                route_key = (
+                    "old_format",
+                    route.get("model_1", ""),
+                    route.get("model_2", ""),
+                    route.get("k_1", 0),
+                    route.get("k_2", 0),
+                    round(float(route.get("w_1", 0.0)), 3)
+                )
+            
+            if route_key not in seen_keys:
+                seen_keys.add(route_key)
+                unique_routes.append(route)
+                
+                if len(unique_routes) >= n:
+                    break
+        
+        return unique_routes
+
+    def forward(self, profile_json: str, n_candidates: int = None, 
+                temperature: float = 0.8, ensure_diversity: bool = True) -> List[dict]:
         n = n_candidates or self.n_per_user
+        routes = []
+        
         if self.local_hf is not None:
             try:
-                routes = self.local_hf.generate(profile_json, n, self.available_models)
+                if ensure_diversity:
+                    candidate_routes = self.local_hf.generate(
+                        profile_json, 
+                        n * 2,
+                        self.available_models,
+                        temperature=temperature,
+                        num_return_sequences=2
+                    )
+                    routes = self._select_diverse_routes(candidate_routes, n)
+                else:
+                    routes = self.local_hf.generate(profile_json, n, self.available_models, temperature=temperature)
             except Exception:
                 routes = []
-        else:
-            routes = []
 
         if len(routes) < n:
             # Fallback: create routing strategies using all available models
