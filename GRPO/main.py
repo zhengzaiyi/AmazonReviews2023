@@ -1,6 +1,7 @@
 import argparse
 import os
 import random
+import json
 import numpy as np
 from typing import List
 
@@ -8,7 +9,7 @@ from .utils import set_seed
 from .data import load_dataset
 from .recallers import RecBoleRecaller
 from .agents import UserProfileAgent, LLMRouterAgent, HFLocalGenerator
-from .selector import PreferenceSelectorNet, GRPOTrainer, GRPOConfig, run_router_only
+from .routing import GRPOTrainer, GRPOConfig
 
 
 def find_latest_checkpoint(model_name: str, checkpoint_dir: str) -> str:
@@ -141,6 +142,7 @@ def initialize_recallers(model_names: List[str], dataset_name: str, checkpoint_d
     print(f"📊 Total recallers initialized: {len(recallers)} ({list(recallers.keys())})")
     return recallers
 
+# TODO: device
 def main(argv: List[str] = None):
     ap = argparse.ArgumentParser(description='GRPO Training for Recommendation Systems')
     ap.add_argument('--dataset', type=str, default='ml-100k')
@@ -160,7 +162,7 @@ def main(argv: List[str] = None):
     ap.add_argument('--save_router_json', type=str, default='')
     ap.add_argument('--router_batch_size', type=int, default=32, help='Batch size for router training')
     ap.add_argument('--use_hf_local', action='store_true')
-    ap.add_argument('--hf_model', type=str, default='meta-llama/Llama-3.2-1B')
+    ap.add_argument('--hf_model', type=str, default='meta-llama/Llama-3.1-8B-Instruct')
     ap.add_argument('--hf_dtype', type=str, default='auto')
     ap.add_argument('--hf_device', type=str, default='auto')
     ap.add_argument('--api_base', type=str, default='')
@@ -180,8 +182,13 @@ def main(argv: List[str] = None):
         seed=args.seed,
         use_latest_checkpoint=args.use_latest_checkpoint
     )
-
-    profile_agent = UserProfileAgent(inter.num_items)
+    data_map_path = os.path.join(args.data_path, f'{args.dataset}', f'{args.dataset}.data_maps')
+    reviews_path = os.path.join(args.data_path, f'{args.dataset}', f'{args.dataset}.reviews')
+    with open(data_map_path, 'r') as f:
+        data_maps = json.load(f)
+    with open(reviews_path, 'r') as f:
+        reviews = json.load(f) 
+    profile_agent = UserProfileAgent(inter.num_items, data_maps, reviews)
     local_hf = None
     if args.use_hf_local:
         local_hf = HFLocalGenerator(args.hf_model, dtype=args.hf_dtype, device=args.hf_device)
@@ -200,25 +207,24 @@ def main(argv: List[str] = None):
             print("Training router using GRPO...")
             
             # Create trainer for router training (no selector needed in router-only mode)
-            trainer = GRPOTrainer(None, GRPOConfig(beta=1.0, group_size=args.group_size, lr=3e-4), router=router)
+            trainer = GRPOTrainer(GRPOConfig(beta=1.0, group_size=args.group_size, lr=3e-4), router=router)
             
             for ep in range(args.epochs):
                 print(f"Epoch {ep+1}/{args.epochs}")
                 random.shuffle(users)
                 
-                res = run_router_only(
-                    users, 
-                    inter.user2item_list_train, 
-                    inter.user2items_test, 
-                    profile_agent, 
-                    router, 
-                    recallers, 
+                res = trainer.run(
+                    users=users, 
+                    histories=inter.user2item_list_train, 
+                    user2items_test=inter.user2items_test, 
+                    profile_agent=profile_agent, 
+                    router=router, 
+                    recallers=recallers, 
                     final_k=args.final_k, 
                     group_size=args.group_size, 
                     strategy=args.router_strategy, 
                     save_router_json=save_path,
-                    grpo_trainer=trainer,
-                    train_router=True,
+                    train_mode=True,
                     batch_size=args.router_batch_size
                 )
                 print(f"[Epoch {ep+1}] Router Training - Loss: {res.get('avg_loss', 0.0):.4f}, Avg Recall@{args.final_k}: {res['avg_recall']:.4f}")
@@ -227,38 +233,25 @@ def main(argv: List[str] = None):
         else:
             # Evaluation mode for router (original behavior)
             print("Evaluating router (no training)...")
-            res = run_router_only(
-                users, 
-                inter.user2item_list_train, 
-                inter.user2items_test, 
-                profile_agent, 
-                router, 
-                recallers, 
+            # Create trainer for evaluation (even though we won't train)
+            trainer = GRPOTrainer(GRPOConfig(), router=None)
+            res = trainer.run(
+                users=users, 
+                histories=inter.user2item_list_train, 
+                user2items_test=inter.user2items_test, 
+                profile_agent=profile_agent, 
+                router=router, 
+                recallers=recallers, 
                 final_k=args.final_k, 
                 group_size=args.group_size, 
                 strategy=args.router_strategy, 
                 save_router_json=save_path,
-                train_router=False
+                train_mode=False
             )
             print(f"Done. Router-only evaluation avg Recall@{args.final_k} = {res['avg_recall']:.4f}")
         return
 
-    selector = PreferenceSelectorNet(available_models=list(recallers.keys()))
-    trainer = GRPOTrainer(selector, GRPOConfig(beta=1.0, group_size=args.group_size, lr=3e-4))
-
-    all_users = list(range(inter.num_users))
-    for ep in range(args.epochs):
-        random.shuffle(all_users)
-        batches = [all_users[i:i+args.users_per_batch] for i in range(0, len(all_users), args.users_per_batch)]
-        logs = []
-        for bu in batches:
-            out = trainer.step(bu, inter.user2item_list_train, inter.user2items_test, profile_agent, router, recallers, final_k=args.final_k)
-            logs.append(out)
-        avg_loss = np.mean([x['loss'] for x in logs if isinstance(x['loss'], (int,float))])
-        avg_recall = np.mean([x['avg_recall'] for x in logs]) if logs else 0.0
-        print(f"[Epoch {ep+1}] loss={avg_loss:.4f} avg Recall@{args.final_k}={avg_recall:.4f}")
-
-    print("Done. Selector trained.")
+    print("Note: Selector training has been deprecated. Use --router_only for router training.")
 
 
 if __name__ == '__main__':

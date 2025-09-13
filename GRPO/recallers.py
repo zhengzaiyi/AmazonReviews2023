@@ -343,7 +343,7 @@ class RecBoleRecaller(BaseRecaller):
             
             # Sort by score and return top-k
             candidates.sort(key=lambda x: x[1], reverse=True)
-            return [item_id for item_id, _ in candidates[:topk]]
+            return candidates[:topk]
 
     def get_user_history(self, user_id: int, split: str = 'train') -> List[int]:
         """Get user's historical interaction sequence

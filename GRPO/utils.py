@@ -11,6 +11,13 @@ def set_seed(seed: int = 42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+def ndcg_at_k(rec_list: List[int], gt_items: List[int], k: int) -> float:
+    if not gt_items: return 0.0
+    k = max(1, k)
+    gt = set(gt_items)
+    hit = sum(1 for x in rec_list[:k] if x in gt)
+    return hit / min(len(gt), k)
+
 def recall_at_k(rec_list: List[int], gt_items: List[int], k: int) -> float:
     if not gt_items: return 0.0
     k = max(1, k)
@@ -18,22 +25,29 @@ def recall_at_k(rec_list: List[int], gt_items: List[int], k: int) -> float:
     hit = sum(1 for x in rec_list[:k] if x in gt)
     return hit / min(len(gt), k)
 
-def merge_candidates(list_1: List[int], list_2: List[int], w_1: float, final_k: int) -> List[int]:
-    w_1 = max(0.0, min(1.0, w_1)); w_2 = 1.0 - w_1
-    n_1 = max(1, int(round(w_1 * 10))); n_2 = max(1, int(round(w_2 * 10)))
-    merged, seen = [], set(); i = j = 0
-    while len(merged) < final_k and (i < len(list_1) or j < len(list_2)):
-        for _ in range(n_1):
-            if i < len(list_1):
-                it = list_1[i]; i += 1
-                if it not in seen: merged.append(it); seen.add(it)
-                if len(merged) >= final_k: break
-        if len(merged) >= final_k: break
-        for _ in range(n_2):
-            if j < len(list_2):
-                it = list_2[j]; j += 1
-                if it not in seen: merged.append(it); seen.add(it)
-                if len(merged) >= final_k: break
+def merge_candidates(lists: List[List[int]], ws: List[float], final_k: int) -> List[int]:
+    merged = []
+    # set scores for each item in each list
+    scores = []
+    for list_ in lists:
+        scores.append({item: i for i, item in enumerate(list_)})
+    # weight scores
+    for i in range(len(scores)):
+        for item in scores[i]:
+            scores[i][item] *= ws[i]
+    # merge items by scores
+    merged = []
+    for i in range(final_k):
+        max_score = -1
+        max_item = None
+        for list_ in scores:
+            if list_ and list_[0] in list_:
+                max_score = list_[0]
+                max_item = list_[0]
+                break
+        if max_item is not None:
+            merged.append(max_item)
+            scores[scores.index(max_score)] = scores[scores.index(max_score)][1:]
     return merged
 
 def average_metrics(metrics_list: List[Dict[str, float]]) -> Dict[str, float]:
