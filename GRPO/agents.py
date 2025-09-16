@@ -1,6 +1,11 @@
 import json
 import math
-from typing import List, Optional
+from typing import List, Optional, Union
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+
+from GRPO.utils import ndcg_at_k
+from collections import defaultdict
 
 try:
     import dspy
@@ -9,170 +14,12 @@ except Exception:
     DSPY_OK = False
 
 import torch
+import torch.nn as nn
 from typing import Dict
 from collections import defaultdict
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+from GRPO.utils import build_prompt
 
-TOOLS_DESCRIPTION = {
-    "sasrec": {
-        "description": "A Transformer-based sequential recommendation model (Self-Attentive Sequential Recommendation). It captures the order and short-term interest patterns from the user's recent interactions.",
-        "when_to_use": "Use when the task requires modeling the sequence of recent user interactions or short-term preferences. For example, predicting the next item a user might click or watch.",
-        "input": "A chronologically ordered sequence of user-item interactions.",
-        "output": "Top-K candidate items predicted as the next likely interactions."
-    },
-    "bpr": {
-        "description": "Bayesian Personalized Ranking, a classic pairwise ranking method based on matrix factorization. It focuses on modeling user preference orderings.",
-        "when_to_use": "Use when the task involves general recommendation based on long-term user preferences, without considering sequence order. Suitable for implicit feedback like clicks or likes.",
-        "input": "A user-item interaction matrix or embeddings representing user and item factors.",
-        "output": "Top-K candidate items ranked by the user's overall preference."
-    },
-    "lightgcn": {
-        "description": "A graph-based recommendation model using Graph Convolutional Networks. It propagates embeddings over a user-item bipartite graph to capture high-order connectivity.",
-        "when_to_use": "Use when the task involves graph structures, such as leveraging user-item relations or higher-order neighbor connections. Suitable for social or community-driven recommendations.",
-        "input": "A user-item bipartite graph.",
-        "output": "Top-K candidate items derived from graph-based user and item embeddings."
-    }
-}
-
-class HFLocalGenerator:
-    def __init__(self, model_name: str, dtype: str = "auto", device: str = "auto"):
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        dtype_map = {
-            "auto": None,
-            "float16": torch.float16,
-            "fp16": torch.float16,
-            "bfloat16": torch.bfloat16,
-            "bf16": torch.bfloat16,
-            "float32": torch.float32,
-            "fp32": torch.float32,
-        }
-        torch_dtype = dtype_map.get(dtype, None)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
-            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-        model_kwargs = {"trust_remote_code": True}
-        if torch_dtype is not None:
-            model_kwargs["torch_dtype"] = torch_dtype
-        if device in ["auto", "balanced"]:
-            model_kwargs["device_map"] = device
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name, 
-            **model_kwargs
-        )
-        
-        self.ref_model = AutoModelForCausalLM.from_pretrained(
-            model_name, 
-            **model_kwargs
-        )
-        for p in self.ref_model.parameters(): p.requires_grad = False
-        self.ref_model.eval()
-        
-
-    @staticmethod
-    def _build_prompt(profile_json: str, n: int, available_models: List[str] = None) -> str:
-        if available_models is None:
-            available_models = ['sasrec', 'bpr', 'pop']
-        models_str = "', '".join(available_models)
-        
-        # Create an example output format
-        import random
-        example_output = [{
-            "name": available_models[i], 
-            "k": random.randint(1, 100), 
-            "weight": round(random.uniform(0, 1), 4)
-        } for i in range(min(2, len(available_models)))]
-
-        
-        example_json = json.dumps(example_output[:min(n, 2)], indent=2)
-        
-        return (
-            "You are a multi-channel recall assistant in a recommendation system. Given a user profile JSON, "
-            "output ONLY a JSON file describe the usage of different models during the multi-channel recall. Each element must be an object with keys: "
-            "\"name\" (string: model name like '"
-            + models_str + "'), \"k\" (int 1..500: number of items), \"weight\" (float 0..1: model weight)\n\n"
-            f"Available models: \n{[json.dumps(TOOLS_DESCRIPTION[m], indent=2) for m in available_models]}\n"
-            f"Profile:\n{profile_json}\n"
-            f"Expected output format example:\n{example_json}\n\n"
-            "Your JSON response (only return the JSON file, no other text):"
-        )
-
-    @staticmethod
-    def _extract_json_array(text: str) -> Optional[List[dict]]:
-        try:
-            s = text.find("["); e = text.rfind("]")
-            if s != -1 and e != -1 and e > s:
-                js = text[s:e+1]
-                data = json.loads(js)
-                if isinstance(data, list):
-                    return data
-        except Exception:
-            return None
-        return None
-
-
-    def get_logprob(self, text: str, label: str) -> dict:
-        """Compute logprob using current model (policy model)"""
-        full_text = text + label
-        
-        inputs = self.tokenizer(full_text, return_tensors="pt").to(self.model.device)
-        labels = inputs["input_ids"].clone()
-        labels[labels == self.tokenizer.pad_token_id] = -100
-        
-        with torch.no_grad():
-            outputs = self.model(**inputs, labels=labels, return_dict=True)
-            loss = outputs.loss
-            avg_logprob = -loss.item()
-            total_logprob = avg_logprob * (labels != -100).sum().item()
-
-        return {"avg_logprob": avg_logprob, "total_logprob": total_logprob}
-
-    def generate(self, profile_json: str, n: int, available_models: List[str] = None, 
-                 temperature: float = 0.8, top_k: int = 50, top_p: float = 0.9, 
-                 num_return_sequences: int = 1,
-                 ref_mode: bool = False) -> dict:
-        prompt = self._build_prompt(profile_json, n, available_models)
-        
-        all_routes = []
-        all_logprobs = []
-        
-        # Use HuggingFace model for generation
-        model = self.model if not ref_mode else self.ref_model
-        with torch.no_grad():
-            inputs = self.tokenizer(prompt, return_tensors="pt").to(model.device)
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=100,
-                min_new_tokens=10,
-                do_sample=True, 
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                num_return_sequences=num_return_sequences,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-                return_dict_in_generate=True,
-                output_scores=True
-                )
-        
-        text = self.tokenizer.batch_decode(outputs.sequences, skip_special_tokens=True)
-        data = [self._extract_json_array(t[len(prompt):]) for t in text]
-        all_routes.extend(data)
-        
-        # Calculate total logprobs directly
-        for i in range(num_return_sequences):
-            total_logprob = 0.0
-            for j, score in enumerate(outputs.scores):
-                log_probs = torch.log_softmax(score[i], dim=-1)
-                token_id = outputs.sequences[i][len(inputs.input_ids[0]) + j]
-                total_logprob += log_probs[token_id].item()
-            all_logprobs.append(total_logprob)
-            
-
-        
-        return {
-            "routes": all_routes,
-            "logprobs": all_logprobs,
-            "ref_mode": ref_mode
-        }
 
 
 class UserProfileAgent:
@@ -215,10 +62,89 @@ class UserProfileAgent:
 
 
 class LLMRouterAgent:
-    def __init__(self, n_per_user: int = 4, local_hf: Optional[HFLocalGenerator] = None, available_models: List[str] = None):
+    def __init__(
+        self, 
+        n_per_user: int = 4, 
+        available_models: List[str] = None
+    ):
         self.n_per_user = n_per_user
-        self.local_hf = local_hf
         self.available_models = available_models or ['sasrec', 'bpr', 'pop']
+            
+    
+    @staticmethod
+    def _extract_json_array(text: str) -> Optional[List[dict]]:
+        """Extract JSON array from generated text"""
+        try:
+            s = text.find("["); e = text.rfind("]")
+            if s != -1 and e != -1 and e > s:
+                js = text[s:e+1]
+                data = json.loads(js)
+                if isinstance(data, list):
+                    return data
+        except Exception:
+            return None
+        return None
+    
+    def get_logprob(self, text: str, label: str, model, tokenizer) -> dict:
+        """Compute logprob using provided model (policy model)"""
+        full_text = text + label
+        
+        inputs = tokenizer(full_text, return_tensors="pt").to(model.device)
+        labels = inputs["input_ids"].clone()
+        labels[labels == tokenizer.pad_token_id] = -100
+        
+        with torch.no_grad():
+            outputs = model(**inputs, labels=labels, return_dict=True)
+            loss = outputs.loss
+            avg_logprob = -loss.item()
+            total_logprob = avg_logprob * (labels != -100).sum().item()
+
+        return {"avg_logprob": avg_logprob, "total_logprob": total_logprob}
+    
+    def generate(self, profile_json: str, model, tokenizer, 
+                 available_models: List[str] = None,
+                 temperature: float = 0.8, top_k: int = 50, top_p: float = 0.9, 
+                 num_return_sequences: int = 1) -> dict:
+        """Generate routes using provided HuggingFace model"""
+        prompt = build_prompt(profile_json, available_models or self.available_models)
+        
+        all_routes = []
+        all_logprobs = []
+        
+        with torch.no_grad():
+            inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=100,
+                min_new_tokens=10,
+                do_sample=True, 
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                num_return_sequences=num_return_sequences,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                return_dict_in_generate=True,
+                output_scores=True
+            )
+        
+        text = tokenizer.batch_decode(outputs.sequences, skip_special_tokens=True)
+        data = [self._extract_json_array(t[len(prompt):]) for t in text]
+        all_routes.extend(data)
+        
+        # Calculate total logprobs directly
+        for i in range(num_return_sequences):
+            total_logprob = 0.0
+            for j, score in enumerate(outputs.scores):
+                log_probs = torch.log_softmax(score[i], dim=-1)
+                token_id = outputs.sequences[i][len(inputs.input_ids[0]) + j]
+                total_logprob += log_probs[token_id].item()
+            all_logprobs.append(total_logprob)
+        
+        return {
+            "routes": all_routes,
+            "logprobs": all_logprobs
+        }
 
     def _select_diverse_routes(self, candidate_routes: List[dict], n: int) -> List[dict]:
         """
@@ -285,74 +211,24 @@ class LLMRouterAgent:
 
     def _clean_and_validate_routes(self, routes: List[dict], n: int) -> List[dict]:
         """Clean and validate route formats"""
-        cleaned = []
-        for j in range(min(n, len(routes))):
-            route = routes[j] if isinstance(routes[j], dict) else {}
-            
-            if "models" in route and isinstance(route["models"], list):
-                # New format - just validate
-                models = []
-                for model_info in route["models"]:
-                    if isinstance(model_info, dict):
-                        model_name = str(model_info.get("name", "")).lower()
-                        if model_name not in self.available_models:
-                            model_name = self.available_models[0] if self.available_models else "sasrec"
-                        
-                        models.append({
-                            "name": model_name,
-                            "k": max(1, min(500, int(model_info.get("k", 50)))),
-                            "weight": max(0.0, min(1.0, model_info.get("weight", 1.0)))
-                        })
-                
-                # Normalize weights
-                total_weight = sum(m["weight"] for m in models)
-                if total_weight > 0:
-                    for model in models:
-                        model["weight"] /= total_weight
-                
-                cleaned.append({"models": models})
-            else:
-                # Old format - convert to new format
-                model_1 = self.available_models[0] if self.available_models else "sasrec"
-                model_2 = self.available_models[1] if len(self.available_models) > 1 else model_1
-                
-                models = [
-                    {"name": model_1, "k": 50, "weight": 0.5},
-                    {"name": model_2, "k": 50, "weight": 0.5}
-                ]
-                cleaned.append({"models": models})
-        
-        # Fill remaining slots
-        while len(cleaned) < n:
-            j = len(cleaned)
-            num_models = len(self.available_models) or 2
-            model_1 = self.available_models[j % num_models] if self.available_models else "sasrec"
-            model_2 = self.available_models[(j+1) % num_models] if self.available_models else "bpr"
-            
-            models = [
-                {"name": model_1, "k": 10*(j+1), "weight": 0.6},
-                {"name": model_2, "k": 10*(j+2), "weight": 0.4}
-            ]
-            cleaned.append({"models": models})
-            
-        return cleaned
+        return routes[:n] # TODO: validate routes
 
-    def forward(self, profile_json: str, n_candidates: int = None, 
-                temperature: float = 0.8, ensure_diversity: bool = True) -> List[dict]:
+    def forward(self, profile_json: str, model=None, tokenizer=None, n_candidates: int = None, 
+                temperature: float = 0.8) -> List[dict]:
         n = n_candidates or self.n_per_user
         
-        # Try LLM generation
+        # Try LLM generation if model is provided
         routes = []
-        if self.local_hf:
-            result = self.local_hf.generate(
+        if model and tokenizer:
+            result = self.generate(
                 profile_json, 
-                n * 2 if ensure_diversity else n,
+                model,
+                tokenizer,
                 self.available_models,
                 temperature=temperature,
-                num_return_sequences=2 if ensure_diversity else 1
+                num_return_sequences=n_candidates
             )
-            candidate_routes = result.get("routes", []) if isinstance(result, dict) else result or []
-            routes = self._select_diverse_routes(candidate_routes, n) if ensure_diversity else candidate_routes
+            routes = result.get("routes", []) if isinstance(result, dict) else result or []
         
         # Use fallback if needed
         if len(routes) < n:
@@ -360,3 +236,78 @@ class LLMRouterAgent:
         
         # Clean and validate
         return self._clean_and_validate_routes(routes, n)
+
+
+def generate_diverse_routes(
+    router: LLMRouterAgent, 
+    prof_json: str, 
+    n_candidates: int, 
+    model: PreTrainedModel, 
+    tokenizer: PreTrainedTokenizerBase, 
+    temperature=0.8, 
+    include_logprobs=False
+):
+    """Generate diverse routes using a single model"""
+    if not include_logprobs:
+        # Simple generation without logprobs
+        return router.forward(
+            prof_json, 
+            model=model,
+            tokenizer=tokenizer,
+            n_candidates=n_candidates, 
+            temperature=temperature, 
+            ensure_diversity=True
+        )
+    
+    # Generate with logprobs
+    result = router.generate(
+        prof_json,
+        n_candidates,
+        model,
+        tokenizer,
+        router.available_models,
+        temperature=temperature,
+        num_return_sequences=n_candidates
+    )
+    
+    routes = result["routes"]
+    logprobs = result["logprobs"]
+    
+    # Apply diversity selection if needed
+    if len(routes) > n_candidates:
+        diverse_routes = router._select_diverse_routes(routes, n_candidates)
+        route_indices = [routes.index(r) for r in diverse_routes]
+        logprobs = [logprobs[i] for i in route_indices]
+        routes = diverse_routes
+    
+    return {
+        "routes": routes,
+        "logprobs": logprobs
+    }
+
+
+def calculate_route_logprobs(
+    router: LLMRouterAgent,
+    prof_json: str,
+    routes: List[dict],
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase
+) -> List[float]:
+    """Calculate log probabilities for given routes"""
+    logprobs = []
+    for route in routes:
+        result = router.get_logprob(prof_json, json.dumps(route), model, tokenizer)
+        logprobs.append(result['total_logprob'])
+    return logprobs
+
+
+# Example usage for GRPO:
+# 1. Generate routes with ref_model
+# ref_result = generate_diverse_routes(router, prof_json, n_candidates, ref_model, tokenizer, include_logprobs=True)
+# ref_routes = ref_result["routes"]
+# ref_logprobs = ref_result["logprobs"]
+#
+# 2. Calculate policy model logprobs for the same routes
+# policy_logprobs = calculate_route_logprobs(router, prof_json, ref_routes, policy_model, tokenizer)
+
+

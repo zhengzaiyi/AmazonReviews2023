@@ -5,12 +5,10 @@ import json
 import numpy as np
 from typing import List
 
-from .utils import set_seed
-from .data import load_dataset
-from .recallers import RecBoleRecaller
-from .agents import UserProfileAgent, LLMRouterAgent, HFLocalGenerator
-from .routing import GRPOTrainer, GRPOConfig
-
+from GRPO.utils import set_seed
+from GRPO.data import load_dataset
+from GRPO.recallers import RecBoleRecaller
+from GRPO.agents import UserProfileAgent, LLMRouterAgent
 
 def find_latest_checkpoint(model_name: str, checkpoint_dir: str) -> str:
     import glob
@@ -148,7 +146,6 @@ def main(argv: List[str] = None):
     ap.add_argument('--dataset', type=str, default='ml-100k')
     ap.add_argument('--data_path', type=str, default='./data')
     ap.add_argument('--epochs', type=int, default=3, help='Number of training epochs')
-    ap.add_argument('--users_per_batch', type=int, default=128)
     ap.add_argument('--group_size', type=int, default=4)
     ap.add_argument('--final_k', type=int, default=50)
     ap.add_argument('--seed', type=int, default=42)
@@ -156,18 +153,12 @@ def main(argv: List[str] = None):
     ap.add_argument('--checkpoint_dir', type=str, default='./checkpoints')
     ap.add_argument('--use_latest_checkpoint', action='store_true')
     ap.add_argument('--router_only', action='store_true', help='Run in router-only mode')
-    ap.add_argument('--train_router', action='store_true', default=True, help='Train router using GRPO when in router_only mode (default: True)')
     ap.add_argument('--eval_only', action='store_true', help='Only evaluate router without training (overrides --train_router)')
-    ap.add_argument('--router_strategy', type=str, default='first', choices=['first','oracle'])
-    ap.add_argument('--save_router_json', type=str, default='')
     ap.add_argument('--router_batch_size', type=int, default=32, help='Batch size for router training')
     ap.add_argument('--use_hf_local', action='store_true')
     ap.add_argument('--hf_model', type=str, default='meta-llama/Llama-3.1-8B-Instruct')
-    ap.add_argument('--hf_dtype', type=str, default='auto')
-    ap.add_argument('--hf_device', type=str, default='auto')
-    ap.add_argument('--api_base', type=str, default='')
-    ap.add_argument('--api_key', type=str, default='')
-    ap.add_argument('--api_model', type=str, default='')
+    # Advanced/legacy args removed: users_per_batch, train_router, router_strategy,
+    # save_router_json, hf_dtype, hf_device, use_trl_grpo, api_base, api_key, api_model
     args = ap.parse_args(argv)
 
     set_seed(args.seed)
@@ -189,66 +180,90 @@ def main(argv: List[str] = None):
     with open(reviews_path, 'r') as f:
         reviews = json.load(f) 
     profile_agent = UserProfileAgent(inter.num_items, data_maps, reviews)
-    local_hf = None
+    # Initialize router
+    router = LLMRouterAgent(
+        n_per_user=args.group_size,
+        available_models=list(recallers.keys())
+    )
+    
+    # Initialize HF models if needed
+    model = ref_model = tokenizer = None
     if args.use_hf_local:
-        local_hf = HFLocalGenerator(args.hf_model, dtype=args.hf_dtype, device=args.hf_device)
-
-    router = LLMRouterAgent(n_per_user=args.group_size, local_hf=local_hf, available_models=list(recallers.keys()))
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        
+        tokenizer = AutoTokenizer.from_pretrained(args.hf_model, trust_remote_code=True)
+        if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+            
+        model = AutoModelForCausalLM.from_pretrained(
+            args.hf_model, 
+            trust_remote_code=True,
+            device_map="auto"
+        )
+        
+        ref_model = AutoModelForCausalLM.from_pretrained(
+            args.hf_model, 
+            trust_remote_code=True,
+            device_map="auto"
+        )
+        for p in ref_model.parameters(): 
+            p.requires_grad = False
+        ref_model.eval()
 
     if args.router_only:
         users = list(range(inter.num_users))
-        save_path = args.save_router_json if args.save_router_json else None
         
-        # Determine if we should train or just evaluate
-        should_train_router = args.train_router and not args.eval_only
+        # Determine if we should train or just evaluate (default: train unless eval_only)
+        should_train_router = not args.eval_only
         
         if should_train_router:
-            # Training mode for router
-            print("Training router using GRPO...")
+            print("Router training is temporarily disabled (no trainer implemented)")
+            # TODO: Implement GRPO training logic or use TRL
+            return
+        
+        # Simplified router evaluation mode
+        print("Evaluating router performance...")
+        cfg = GRPOConfig(beta=1.0, group_size=args.group_size)
+        
+        total_recalls = []
+        for uid in users:
+            hist = inter.user2item_list_train.get(uid, [])
+            prof_json = profile_agent.forward(uid, hist).profile_json
             
-            # Create trainer for router training (no selector needed in router-only mode)
-            trainer = GRPOTrainer(GRPOConfig(beta=1.0, group_size=args.group_size, lr=3e-4), router=router)
+            # Use router to generate routes directly
+            result = router.forward(prof_json, n_candidates=cfg.group_size, temperature=cfg.temperature)
+            routes = result.get("routes", [])
             
-            for ep in range(args.epochs):
-                print(f"Epoch {ep+1}/{args.epochs}")
-                random.shuffle(users)
+            if not routes:
+                continue
                 
-                res = trainer.run(
-                    users=users, 
-                    histories=inter.user2item_list_train, 
-                    user2items_test=inter.user2items_test, 
-                    profile_agent=profile_agent, 
-                    router=router, 
-                    recallers=recallers, 
-                    final_k=args.final_k, 
-                    group_size=args.group_size, 
-                    strategy=args.router_strategy, 
-                    save_router_json=save_path,
-                    train_mode=True,
-                    batch_size=args.router_batch_size
-                )
-                print(f"[Epoch {ep+1}] Router Training - Loss: {res.get('avg_loss', 0.0):.4f}, Avg Recall@{args.final_k}: {res['avg_recall']:.4f}")
+            # Select first route for evaluation
+            chosen_route = routes[0]
             
-            print(f"Done. Router training completed. Final avg Recall@{args.final_k} = {res['avg_recall']:.4f}")
-        else:
-            # Evaluation mode for router (original behavior)
-            print("Evaluating router (no training)...")
-            # Create trainer for evaluation (even though we won't train)
-            trainer = GRPOTrainer(GRPOConfig(), router=None)
-            res = trainer.run(
-                users=users, 
-                histories=inter.user2item_list_train, 
-                user2items_test=inter.user2items_test, 
-                profile_agent=profile_agent, 
-                router=router, 
-                recallers=recallers, 
-                final_k=args.final_k, 
-                group_size=args.group_size, 
-                strategy=args.router_strategy, 
-                save_router_json=save_path,
-                train_mode=False
-            )
-            print(f"Done. Router-only evaluation avg Recall@{args.final_k} = {res['avg_recall']:.4f}")
+            # Calculate recommendation results
+            from collections import defaultdict
+            candidates = defaultdict(int)
+            
+            for model_usage in chosen_route:
+                model_name = model_usage.get("name", "")
+                k = model_usage.get("k", 10)
+                weight = model_usage.get("weight", 1.0)
+                
+                if model_name in recallers:
+                    items = recallers[model_name].recall(uid, int(k), hist)
+                    for item in items:
+                        candidates[item[0]] += item[1] * weight
+            
+            # Sort by score and take top-k
+            final_candidates = sorted(candidates.keys(), key=lambda x: candidates[x], reverse=True)[:args.final_k]
+            
+            # Calculate recall
+            from .utils import recall_at_k
+            recall = recall_at_k(final_candidates, inter.user2items_test.get(uid, []), args.final_k)
+            total_recalls.append(recall)
+        
+        avg_recall = sum(total_recalls) / len(total_recalls) if total_recalls else 0.0
+        print(f"Done. Router evaluation avg Recall@{args.final_k} = {avg_recall:.4f}")
         return
 
     print("Note: Selector training has been deprecated. Use --router_only for router training.")
