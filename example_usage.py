@@ -1,33 +1,33 @@
 #!/usr/bin/env python3
 """
-使用RecBole模型的GRPO示例
+GRPO examples using RecBole models
 """
 
 import os
 import sys
 
 def main():
-    # 示例1: 使用RecBole模型进行路由器推荐（Router-only模式）
-    print("示例1: Router-only模式，使用已训练的RecBole模型")
+    # Example 1: Use RecBole models for router recommendation (Router-only mode)
+    print("Example 1: Router-only mode using trained RecBole models")
     
     cmd1 = [
         "python", "GRPO.py",
-        "--dataset", "All_Beauty",  # 根据你的数据集名称调整
+        "--dataset", "All_Beauty",  # Adjust according to your dataset name
         "--data_path", "./data",
-        "--recbole_models", "SASRec", "BPR", "Pop",  # 使用的RecBole模型
+        "--recbole_models", "SASRec", "BPR", "Pop",  # RecBole models to use
         "--checkpoint_dir", "./checkpoints",
-        "--use_latest_checkpoint",  # 使用最新的checkpoint
-        "--router_only",  # 只使用router
+        "--use_latest_checkpoint",  # Use the latest checkpoint
+        "--router_only",  # Use router only
         "--final_k", "50",
         "--group_size", "4",
         "--seed", "42"
     ]
     
-    print("命令1:", " ".join(cmd1))
+    print("Command 1:", " ".join(cmd1))
     print()
     
-    # 示例2: 训练router（GRPO）
-    print("示例2: 训练模式，使用GRPO训练router")
+    # Example 2: Train router (GRPO)
+    print("Example 2: Training mode, using GRPO to train router")
     
     cmd2 = [
         "python", "GRPO.py",
@@ -44,11 +44,11 @@ def main():
         "--seed", "42"
     ]
     
-    print("命令2:", " ".join(cmd2))
+    print("Command 2:", " ".join(cmd2))
     print()
     
-    # 示例3: 使用HuggingFace本地模型做路由
-    print("示例3: 使用本地HuggingFace模型进行路由")
+    # Example 3: Use local HuggingFace model for routing
+    print("Example 3: Using local HuggingFace model for routing")
     
     cmd3 = [
         "python", "GRPO.py",
@@ -58,20 +58,20 @@ def main():
         "--checkpoint_dir", "./checkpoints", 
         "--use_latest_checkpoint",
         "--router_only",
-        "--use_hf_local",  # 使用本地HF模型
-        "--hf_model", "microsoft/DialoGPT-medium",  # 指定模型
+        "--use_hf_local",  # Use local HF model
+        "--hf_model", "microsoft/DialoGPT-medium",  # Specify model
         "--final_k", "50"
     ]
     
-    print("命令3:", " ".join(cmd3))
+    print("Command 3:", " ".join(cmd3))
     print()
     
-    print("注意事项:")
-    print("1. 确保你的数据集在./data目录下，格式符合RecBole要求")
-    print("2. 确保./checkpoints目录下有对应模型的训练好的权重文件")
-    print("3. 模型名称需要与checkpoint文件名前缀匹配，如'SASRec-Aug-26-2025_16-28-37.pth'")
-    print("4. 如果没有checkpoint，系统会使用未训练的模型")
-    print("5. 可用的RecBole模型包括: SASRec, BPR, Pop, ItemKNN等")
+    print("Notes:")
+    print("1. Ensure your dataset is in ./data directory and follows RecBole format requirements")
+    print("2. Ensure trained model weight files exist in ./checkpoints directory")
+    print("3. Model names should match checkpoint file name prefixes, e.g., 'SASRec-Aug-26-2025_16-28-37.pth'")
+    print("4. If no checkpoint exists, the system will use untrained models")
+    print("5. Available RecBole models include: SASRec, BPR, Pop, ItemKNN, etc.")
 
 if __name__ == "__main__":
     main()

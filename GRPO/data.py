@@ -16,12 +16,17 @@ except Exception:
 
 @dataclass
 class InteractionData:
-    user2item_list_train: Dict[int, List[int]]
-    user2item_list_test: Dict[int, List[int]]
-    user2items_train: Dict[int, List[int]]
-    user2items_test: Dict[int, List[int]]
     num_users: int
     num_items: int
+    train_user_ids: List[int]
+    train_histories: List[List[int]]
+    train_target_items: List[int]
+    eval_user_ids: List[int]
+    eval_histories: List[List[int]]
+    eval_target_items: List[int]
+    test_user_ids: List[int]
+    test_histories: List[List[int]]
+    test_target_items: List[int]
 
 
 def load_dataset(dataset: str, data_path: str, seed: int = 42) -> InteractionData:
@@ -34,37 +39,35 @@ def load_dataset(dataset: str, data_path: str, seed: int = 42) -> InteractionDat
                 "seed": seed,
                 'load_col': {
                     'inter': ['user_id', 'item_id_list', 'item_id']
-                    },
-                    'benchmark_filename': ['train', 'valid', 'test'],
-                    'alias_of_item_id': ['item_id_list'],
-                    'train_neg_sample_args': None,
-                    'loss_type': 'CE',
-                }
-            )
-        recbole_init_seed(cfg["seed"], reproducibility=True)
+                },
+                'benchmark_filename': ['train', 'valid', 'test'],
+                'alias_of_item_id': ['item_id_list'],
+                'train_neg_sample_args': None,
+                'loss_type': 'CE',
+            },     
+        )
+        recbole_init_seed(cfg["seed"], reproducibility=True) # TODO: check if this is correct
         ds = create_dataset(cfg)
         train, valid, test = data_preparation(cfg, ds)
+
         uid_field, iid_field = ds.uid_field, ds.iid_field
-        user2item_list_train, user2item_list_test = {}, {}
-        user2items_train, user2items_test = {}, {}
 
-        train_user_ids, train_item_id_lists, train_item_ids = train.dataset.inter_feat.interaction['user_id'], train.dataset.inter_feat.interaction['item_id_list'], train.dataset.inter_feat.interaction['item_id']
-        for i in range(len(train.dataset.inter_feat)):
-            user = int(train_user_ids[i])
-            item_id_list = train_item_id_lists[i].detach()
-            item = int(train_item_ids[i])
-            
-            user2item_list_train[user] = [int(it) for it in item_id_list if it > 0]
-            user2items_train.setdefault(user, []).append(item)
-        test_user_ids, test_item_id_lists, test_item_ids = test.dataset.inter_feat.interaction['user_id'], test.dataset.inter_feat.interaction['item_id_list'], test.dataset.inter_feat.interaction['item_id']
-
-        for i in range(len(test.dataset.inter_feat)):
-            user = int(test_user_ids[i])
-            item_id_list = test_item_id_lists[i].detach()
-            item = int(test_item_ids[i])
-            user2item_list_test[user] = [int(it) for it in item_id_list if it > 0]
-            user2items_test.setdefault(user, []).append(item)
-        return InteractionData(user2item_list_train, user2item_list_test, user2items_train, user2items_test, ds.user_num, ds.item_num)
+        train_user_ids, train_item_id_lists, train_item_ids = train.dataset.inter_feat.interaction[uid_field], train.dataset.inter_feat.interaction['item_id_list'], train.dataset.inter_feat.interaction[iid_field]
+        eval_user_ids, eval_item_id_lists, eval_item_ids = valid.dataset.inter_feat.interaction[uid_field], valid.dataset.inter_feat.interaction['item_id_list'], valid.dataset.inter_feat.interaction[iid_field]
+        test_user_ids, test_item_id_lists, test_item_ids = test.dataset.inter_feat.interaction[uid_field], test.dataset.inter_feat.interaction['item_id_list'], test.dataset.inter_feat.interaction[iid_field]
+        return InteractionData(
+            ds.user_num, 
+            ds.item_num, 
+            train_user_ids.tolist(), 
+            train_item_id_lists.tolist(), 
+            train_item_ids.tolist(), 
+            eval_user_ids.tolist(), 
+            eval_item_id_lists.tolist(), 
+            eval_item_ids.tolist(), 
+            test_user_ids.tolist(), 
+            test_item_id_lists.tolist(), 
+            test_item_ids.tolist()
+        )
     # Fallback synthetic
     rng = np.random.default_rng(seed)
     num_users, num_items = 500, 2000

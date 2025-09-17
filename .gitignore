@@ -28,6 +28,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+wandb/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -167,3 +168,4 @@ cython_debug/
 seq_rec_results/log_tensorboard/
 seq_rec_results/saved/
 seq_rec_results/dataset/processed/
+grpo_models/

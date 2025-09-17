@@ -83,67 +83,125 @@ TOOLS_DESCRIPTION = {
 }
 
 def build_prompt(profile_json: str, available_models: List[str] = None) -> str:
-        if available_models is None:
-            available_models = ['sasrec', 'bpr', 'pop']
-        models_str = "', '".join(available_models)
+    if available_models is None:
+        available_models = ['sasrec', 'bpr', 'pop']
+    models_str = "', '".join(available_models)
         
-        # Create an example output format
-        import random
-        example_output = [{
-            "name": available_models[i], 
-            "k": random.randint(1, 100), 
-            "weight": round(random.uniform(0, 1), 4)
-        } for i in range(min(2, len(available_models)))]
-        example_output = json.dumps(example_output, indent=2)
+    # Create an example output format
+    import random
+    example_output = {
+        model: {
+            "top-k": random.randint(10, 100),
+            "score-weight": round(random.uniform(0.1, 1.0), 4)
+        } for model in available_models[:2]
+    }
+    example_output = json.dumps(example_output, indent=2)
 
-        return (
-            "You are a multi-channel recall assistant in a recommendation system. Given a user profile JSON, "
-            "output ONLY a JSON file describe the usage of different models during the multi-channel recall. Each element must be an object with keys: "
-            "\"name\" (string: model name like '"
-            + models_str + "'), \"k\" (int 1..500: number of items), \"weight\" (float 0..1: model weight)\n\n"
-            f"Available models: \n{[json.dumps(TOOLS_DESCRIPTION[m], indent=2) for m in available_models]}\n"
-            f"Profile:\n{profile_json}\n"
-            f"Expected output format example:\n{example_output}\n\n"
-            "Your JSON response:"
-        )
+    return (
+        "You are a multi-channel recall assistant in a recommendation system. Given a user profile JSON, "
+        "output ONLY a JSON file describe the usage of different models during the multi-channel recall. Each element must be an object with keys: "
+        "\"name\" (string: model name like '"
+        + models_str + "'), \"k\" (int 1..500: number of items), \"weight\" (float 0..1: model weight)\n\n"
+        f"Available models: \n{[json.dumps(TOOLS_DESCRIPTION[m], indent=2) for m in available_models]}\n"
+        f"Profile:\n{profile_json}\n"
+        f"Expected output format example:\n{example_output}\n\n"
+        "Your JSON response:"
+    )
 
 
 def ndcg_rewards(
     completions: List[List[dict]], 
     uid: List[int], 
     histories: List[List[int]], 
-    user2items_test: List[List[int]], 
+    target_items: List[List[int]], 
     recallers: Dict[str, RecBoleRecaller], 
     final_k: int, 
     **kwargs
 ):
-    """Calculate NDCG rewards"""
+    """Abandoned"""
     rewards = []
     
     for i, completion_msgs in enumerate(completions):
         try:
             # Extract routing content
             content = completion_msgs[-1]["content"]
-            routes = json.loads(content)
+            model_configs = json.loads(content)
             
             # Calculate recommendation results
             candidates = defaultdict(int)
-            for route in routes:
-                model_name = route.get("name", "")
-                k = route.get("k", 10) 
-                w = route.get("weight", 1.0)
+            total_k = 0
+            for recaller in recallers.keys():
+                total_k += model_configs[recaller]['top-k']
+            for recaller in recallers.keys():
+                k = model_configs[recaller]['top-k'] * final_k / total_k
+                w = model_configs[recaller]['score-weight']
                 
-                if model_name in recallers:
-                    items = recallers[model_name].recall(uid[i], int(k), histories[i])
+                if recaller in recallers:
+                    items = recallers[recaller].recall(uid[i], int(k), histories[i])
                     for item in items:
                         candidates[item[0]] += item[1] * w
             
             # Calculate NDCG
             candidates = sorted(candidates.keys(), key=lambda x: candidates[x], reverse=True)[:final_k]
-            ndcg = ndcg_at_k(candidates, user2items_test[i], k=final_k)
+            ndcg = ndcg_at_k(candidates, target_items[i], k=final_k)
             rewards.append(ndcg)
         except Exception as e:
             print(f"Error processing completion: {e}")
             rewards.append(0)
     
     return rewards
+
+def multi_channel_recall(
+    completions: List[List[dict]], 
+    uid: List[int], 
+    histories: List[List[int]], 
+    recallers: Dict[str, RecBoleRecaller], 
+    final_k: int, 
+) -> List[List[int]]:
+    """Calculate multi-channel recall"""
+    recall_results = []
+    for i, completion_msgs in enumerate(completions):
+        content = completion_msgs[-1]["content"]
+        model_configs = json.loads(content)
+            
+        # Calculate recommendation results
+        candidates = defaultdict(int)
+        total_k = 0
+        for recaller in recallers.keys():
+            total_k += model_configs[recaller]['top-k']
+        for recaller in recallers.keys():
+            k = model_configs[recaller]['top-k'] * final_k / total_k
+            w = model_configs[recaller]['score-weight']
+            
+            if recaller in recallers:
+                items = recallers[recaller].recall(uid[i], int(k), histories[i])
+                for item in items:
+                    candidates[item[0]] += item[1] * w
+        candidates = sorted(candidates.keys(), key=lambda x: candidates[x], reverse=True)[:final_k]
+        recall_results.append(candidates)
+    return recall_results
+
+def evaluate(
+    completions: List[List[dict]], 
+    uid: List[int], 
+    histories: List[List[int]], 
+    recallers: Dict[str, RecBoleRecaller], 
+    final_k: int, 
+    target_items: List[List[int]],
+    ks: List[int] = [10, 50],
+) -> Dict[str, float]:
+    recall_results = multi_channel_recall(
+        completions=completions, 
+        uid=uid, 
+        histories=histories, 
+        recallers=recallers, 
+        final_k=final_k
+    )
+    metrics = defaultdict(list)
+    for i, recall_result in enumerate(recall_results):
+        for k in ks:
+            metrics[f"ndcg@{k}"].append(ndcg_at_k(recall_result, target_items[i], k=k))
+            metrics[f"recall@{k}"].append(recall_at_k(recall_result, target_items[i], k=k))
+    return {
+        k: sum(v) / len(v) for k, v in metrics.items()
+    }

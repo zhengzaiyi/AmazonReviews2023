@@ -38,7 +38,8 @@ class RecBoleRecaller(BaseRecaller):
             'topk': [10, 20],
             'valid_metric': 'NDCG@10',
             'checkpoint_dir': './checkpoints/',
-            'show_progress': True
+            'show_progress': True,
+            'gpu_id': '',
         }
         
         # Model-specific configurations based on RecBole documentation
@@ -149,7 +150,7 @@ class RecBoleRecaller(BaseRecaller):
         from recbole.config import Config
         from recbole.data import create_dataset, data_preparation
         from recbole.utils import init_seed as recbole_init_seed
-
+        # original_cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
         # Get model class
         self.model_class = get_recbole_model(self.model_name)
         
@@ -172,6 +173,11 @@ class RecBoleRecaller(BaseRecaller):
         self.num_items = self.dataset.item_num
         
         # Initialize model
+        # if original_cuda_devices is not None:
+        #     os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_devices
+        # elif "CUDA_VISIBLE_DEVICES" in os.environ:
+        #     # if original_cuda_devices is not set, delete the environment variable
+        #     del os.environ["CUDA_VISIBLE_DEVICES"]
         self.model = self.model_class(self.config, self.dataset).to(self.config['device'])
 
         # Load checkpoint if provided

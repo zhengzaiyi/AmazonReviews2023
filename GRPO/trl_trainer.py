@@ -537,6 +537,7 @@ class GRPOTrainer(Trainer):
                     max_num_batched_tokens=4096,
                     model_impl=self.args.vllm_model_impl,
                     enable_sleep_mode=self.args.vllm_enable_sleep_mode,
+                    dtype="bfloat16",
                 )
                 if self.args.vllm_enable_sleep_mode:
                     self.llm.sleep(level=1)
@@ -545,6 +546,7 @@ class GRPOTrainer(Trainer):
 
             # vLLM specific sampling arguments
             self.guided_decoding_regex = args.vllm_guided_decoding_regex
+            self.guided_decoding_json = args.vllm_guided_decoding_json
 
             self._last_loaded_step = -1  # tag to avoid useless loading during grad accumulation
 
@@ -1202,6 +1204,8 @@ class GRPOTrainer(Trainer):
             elif self.vllm_mode == "colocate":
                 if self.guided_decoding_regex:
                     guided_decoding = GuidedDecodingParams(regex=self.guided_decoding_regex)
+                elif self.guided_decoding_json:
+                    guided_decoding = GuidedDecodingParams(json=self.guided_decoding_json)
                 else:
                     guided_decoding = None
 

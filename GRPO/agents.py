@@ -6,6 +6,8 @@ from typing import Dict, List, Optional
 
 from GRPO.utils import ndcg_at_k
 from collections import defaultdict
+from pydantic.config import ConfigDict
+import outlines
 
 try:
     import dspy
@@ -17,9 +19,10 @@ import torch
 import torch.nn as nn
 from typing import Dict
 from collections import defaultdict
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase, AutoModel
 from GRPO.utils import build_prompt
-
+from pydantic import BaseModel, Field, create_model
+from typing import Dict, List, Type
 
 
 class UserProfileAgent:
@@ -300,6 +303,44 @@ def calculate_route_logprobs(
         logprobs.append(result['total_logprob'])
     return logprobs
 
+class PerModelConfig(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+        # populate_by_name=True
+    )
+    k: int = Field(default=50, alias='top-k', description="Number of top items to retrieve")
+    w: float = Field(default=1.0, alias='score-weight', description="Weight for scoring")
+
+def create_model_config(
+    available_models: List[str], 
+    default_configs: Optional[Dict[str, BaseModel]] = None,
+    class_name: str = "ModelConfigs"
+) -> Type[BaseModel]:
+    """
+    Create an advanced dynamic Pydantic model with support for custom default configurations
+    
+    Args:
+        available_models: List of available model names
+        default_configs: Optional dictionary of default configurations
+        class_name: Name of the generated class
+    
+    Returns:
+        Dynamically created Pydantic model class
+    """
+    default_configs = default_configs or {}
+    
+    fields = {}
+    for model_name in available_models:
+        default_config = default_configs.get(model_name, PerModelConfig()) if default_configs else PerModelConfig()
+        
+        fields[model_name] = (
+            PerModelConfig, 
+            Field(default=default_config, description=f"Configuration for {model_name} model")
+        )
+    
+    ModelConfigs = create_model(class_name, **fields, __base__=BaseModel)
+    
+    return ModelConfigs
 
 # Example usage for GRPO:
 # 1. Generate routes with ref_model
