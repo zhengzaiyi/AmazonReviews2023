@@ -52,12 +52,13 @@ class UserProfileAgent:
         return self.id2meta[str(item_id)]
 
     def forward(self, user_id: int, history: List[int]):
+        item_id_history = [self.item2id[item] for item in history]
         user_profile_dict = {
             "user id": int(user_id), 
             "purchased item numbers": len(history),
             "purchased items": [self._get_item_metadata(item_id) for item_id in history],
             "last purchased item": self._get_item_metadata(history[-1]) if history else -1, 
-            "reviews": self.reviews[user_id],
+            "reviews": [review for review in self.reviews[user_id] if review["item"] in item_id_history],
         }
         class _Out:
             def __init__(self, js): self.profile_json = js

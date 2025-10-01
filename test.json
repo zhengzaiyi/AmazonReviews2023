@@ -1,10 +1,22 @@
 {
-    "LightGCN": {
-        "k": 50,
-        "w": 0.5
+    "sasrec": {
+        "top-k":68, 
+        "score-weight":0.1029
     },
-    "Popularity": {
-        "k": 10,
-        "w": 0.2
+    "itemknn": {
+        "top-k":23, 
+        "score-weight":0.8835
+    },
+    "fpmc": {
+        "top-k":43, 
+        "score-weight":0.9747
+    },
+    "pop": {
+        "top-k":32, 
+        "score-weight":0.5569
+    },
+    "bpr": {
+        "top-k": 47,
+        "score-weight":0.4913
     }
 }

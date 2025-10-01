@@ -1,6 +1,6 @@
 data_path: 'dataset/processed/'
 benchmark_filename: [train, valid, test]
-alias_of_item_id: [item_id_list]
+# alias_of_item_id: [item_id_list]
 load_col:
   inter: [user_id, item_id_list, item_id]
 train_neg_sample_args: ~

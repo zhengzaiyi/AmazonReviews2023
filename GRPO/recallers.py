@@ -3,7 +3,17 @@ import os
 import torch
 import numpy as np
 
-from .data import InteractionData
+from .data import InteractionData, get_base_config_dict
+
+def find_latest_checkpoint(model_name: str, checkpoint_dir: str) -> str:
+    import glob
+    pattern = os.path.join(checkpoint_dir, f"{model_name}*.pth")
+    checkpoints = glob.glob(pattern)
+    if not checkpoints:
+        return None
+    checkpoints.sort(key=os.path.getmtime, reverse=True)
+    return checkpoints[0]
+
 
 class BaseRecaller:
     def __init__(self, name: str, num_items: int):
@@ -15,8 +25,8 @@ class BaseRecaller:
 
 class RecBoleRecaller(BaseRecaller):
     def __init__(self, model_name: str, dataset_name: str, checkpoint_path: str,
-                 data_path: str = "./data", config_dict: dict = None):
-        super().__init__(model_name.lower(), 0)
+                 data_path: str = "./data", config_dict: dict = None, num_items: int = 0):
+        super().__init__(model_name.lower(), num_items=num_items)
         self.model_name = model_name
         self.dataset_name = dataset_name
         self.checkpoint_path = checkpoint_path
@@ -26,27 +36,12 @@ class RecBoleRecaller(BaseRecaller):
 
     def _get_model_config(self):
         """Get specific configuration for each model type"""
-        
         # Base configuration
-        base_config = {
-            'data_path': self.data_path,
-            'benchmark_filename': ['train', 'valid', 'test'],
-            'epochs': 10,
-            'stopping_step': 10,
-            'eval_step': 1,
-            'metrics': ['Recall', 'NDCG'],
-            'topk': [10, 20],
-            'valid_metric': 'NDCG@10',
-            'checkpoint_dir': './checkpoints/',
-            'show_progress': True,
-            'gpu_id': '',
-        }
-        
+        base_config = get_base_config_dict(self.dataset_name)
         # Model-specific configurations based on RecBole documentation
         if self.model_name == 'BPR':
             model_config = {
                 **base_config,
-                'load_col': {'inter': ['user_id', 'item_id']},
                 'train_neg_sample_args': {
                     'distribution': 'uniform',
                     'sample_num': 1,
@@ -57,18 +52,18 @@ class RecBoleRecaller(BaseRecaller):
                 'loss_type': 'BPR',
                 'embedding_size': 64,
                 'learning_rate': 0.001,
-                'train_batch_size': 2048,
+                'train_batch_size': 4096,
+                'eval_batch_size': 4096 * self.num_items,
             }
             
         elif self.model_name == 'SASRec':
             model_config = {
                 **base_config,
-                'load_col': {'inter': ['user_id', 'item_id_list', 'item_id']},
-                'alias_of_item_id': ['item_id_list'],
                 'train_neg_sample_args': None,
                 'loss_type': 'CE',
                 'learning_rate': 0.001,
-                'train_batch_size': 256,
+                'train_batch_size': 4096,
+                'eval_batch_size': 4096,
                 'max_seq_length': 50,
                 'hidden_size': 64,
                 'n_layers': 2,
@@ -84,7 +79,6 @@ class RecBoleRecaller(BaseRecaller):
         elif self.model_name == 'Pop':
             model_config = {
                 **base_config,
-                'load_col': {'inter': ['user_id', 'item_id']},
                 'train_neg_sample_args': None,
                 'epochs': 1,  # Pop model doesn't need many epochs
             }
@@ -92,17 +86,15 @@ class RecBoleRecaller(BaseRecaller):
         elif self.model_name == 'ItemKNN':
             model_config = {
                 **base_config,
-                'load_col': {'inter': ['user_id', 'item_id']},
                 'train_neg_sample_args': None,
-                'k': 50,  # Number of similar items
-                'shrink': 0.0,  # Shrinkage parameter
+                'k': 20,  # Number of similar items
+                # 'shrink': 0.0,  # Shrinkage parameter
+                'eval_batch_size': 4096 * self.num_items,
             }
             
         elif self.model_name == 'FPMC':
             model_config = {
                 **base_config,
-                'load_col': {'inter': ['user_id', 'item_id_list', 'item_id']},
-                'alias_of_item_id': ['item_id_list'],
                 'train_neg_sample_args': {
                     'distribution': 'uniform',
                     'sample_num': 1
@@ -115,8 +107,6 @@ class RecBoleRecaller(BaseRecaller):
         elif self.model_name == 'GRU4Rec':
             model_config = {
                 **base_config,
-                'load_col': {'inter': ['user_id', 'item_id_list', 'item_id']},
-                'alias_of_item_id': ['item_id_list'],
                 'train_neg_sample_args': None,
                 'loss_type': 'CE',
                 'embedding_size': 64,
@@ -125,12 +115,18 @@ class RecBoleRecaller(BaseRecaller):
                 'dropout_prob': 0.3,
                 'learning_rate': 0.001,
             }
-            
+        elif self.model_name == 'LightGCN':
+            model_config = {
+                **base_config,
+                'train_neg_sample_args': None,
+                'loss_type': 'BPR',
+                'embedding_size': 64,
+                'learning_rate': 0.001,
+            }
         else:
             # Default configuration for other models
             model_config = {
                 **base_config,
-                'load_col': {'inter': ['user_id', 'item_id']},
                 'train_neg_sample_args': {
                     'distribution': 'uniform',
                     'sample_num': 1
@@ -142,6 +138,7 @@ class RecBoleRecaller(BaseRecaller):
         
         # Update with user-provided config
         model_config.update(self.config_dict)
+        model_config['dataset_save_path'] = f'dataset/{self.dataset_name}/5core_{self.model_name}.pth'
         return model_config
 
     def _init_recbole_model(self):
@@ -150,13 +147,12 @@ class RecBoleRecaller(BaseRecaller):
         from recbole.config import Config
         from recbole.data import create_dataset, data_preparation
         from recbole.utils import init_seed as recbole_init_seed
-        # original_cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
         # Get model class
         self.model_class = get_recbole_model(self.model_name)
         
         # Get model-specific configuration
         model_config = self._get_model_config()
-
+        model_config['checkpoint_dir'] = self.checkpoint_path
         # Create RecBole config
         self.config = Config(
             model=self.model_name, 
@@ -170,26 +166,31 @@ class RecBoleRecaller(BaseRecaller):
         # Create dataset and prepare data
         self.dataset = create_dataset(self.config)
         self.train_data, self.valid_data, self.test_data = data_preparation(self.config, self.dataset)
-        self.num_items = self.dataset.item_num
         
         # Initialize model
-        # if original_cuda_devices is not None:
-        #     os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_devices
-        # elif "CUDA_VISIBLE_DEVICES" in os.environ:
-        #     # if original_cuda_devices is not set, delete the environment variable
-        #     del os.environ["CUDA_VISIBLE_DEVICES"]
         self.model = self.model_class(self.config, self.dataset).to(self.config['device'])
 
         # Load checkpoint if provided
-        if self.checkpoint_path and os.path.exists(self.checkpoint_path):
-            checkpoint = torch.load(self.checkpoint_path, map_location=self.config['device'], weights_only=False)
+        if self.checkpoint_path and find_latest_checkpoint(self.model_name, self.checkpoint_path) and self.model_name not in ['Pop']:
+            # Load checkpoint
+            model_path = find_latest_checkpoint(self.model_name, self.checkpoint_path)
+            print(f"Loading checkpoint from {model_path} for model {self.model_name}")
+            checkpoint = torch.load(model_path, map_location=self.config['device'], weights_only=False)
             self.model.load_state_dict(checkpoint['state_dict'], strict=False)
             self.model.eval()
+        else: # not in training free models
+            print(f"Training model {self.model_name} from scratch and saving checkpoint to {self.checkpoint_path}")
+            # Train model
+            self.trainer = get_trainer(self.config['MODEL_TYPE'], self.config['model'])(self.config, self.model)
+            best_valid_score, best_valid_result = self.trainer.fit(
+                self.train_data, self.valid_data, saved=True, show_progress=True
+            )
             
-        # Initialize trainer
-        self.trainer = get_trainer(self.config['MODEL_TYPE'], self.config['model'])(self.config, self.model)
+            print(f"{self.model_name} training completed!")
+            print(f"Best validation result: {best_valid_result}")
         
         # Build user-item mappings
+        self.iid_list_field = f'{self.dataset.iid_field}_list'
         self._build_user_item_mappings()
 
     def _build_user_item_mappings(self):
@@ -206,9 +207,9 @@ class RecBoleRecaller(BaseRecaller):
         if hasattr(self.train_data.dataset.inter_feat, 'interaction'):
             # For sequential models with item_id_list
             interaction = self.train_data.dataset.inter_feat.interaction
-            train_user_ids = interaction['user_id']
-            train_item_id_lists = interaction['item_id_list'] if 'item_id_list' in interaction.keys() else [[]]*len(train_user_ids)
-            train_item_ids = interaction['item_id']
+            train_user_ids = interaction[uid_field]
+            train_item_id_lists = interaction[self.iid_list_field] if self.iid_list_field in interaction.keys() else [[]]*len(train_user_ids)
+            train_item_ids = interaction[iid_field]
                 
             for i in range(len(self.train_data.dataset.inter_feat)):
                 user_id = int(train_user_ids[i])
@@ -232,9 +233,9 @@ class RecBoleRecaller(BaseRecaller):
         if hasattr(self.test_data.dataset.inter_feat, 'interaction'):
             # For sequential models with item_id_list
             inter = self.test_data.dataset.inter_feat.interaction
-            test_user_ids = inter['user_id']
-            test_item_id_lists = inter['item_id_list'] if 'item_id_list' in inter.keys() else [[]]*len(test_user_ids)
-            test_item_ids = inter['item_id']
+            test_user_ids = inter[uid_field]
+            test_item_id_lists = inter[self.iid_list_field] if self.iid_list_field in inter.keys() else [[]]*len(test_user_ids)
+            test_item_ids = inter[iid_field]
                 
             for i in range(len(self.test_data.dataset.inter_feat)):
                 user_id = int(test_user_ids[i])
@@ -254,44 +255,48 @@ class RecBoleRecaller(BaseRecaller):
                 self.user2items_test.setdefault(user_id, []).append(item_id)
                 self.user2item_list_test[user_id] = self.user2items_train.get(user_id, [])
 
-    def _create_user_interaction(self, user_id: int) -> Optional[object]:
+    def _create_user_interaction(self, user_id: int, history: List[int] = None) -> Optional[object]:
         """Create a proper Interaction object for the given user"""
-        try:
-            from recbole.data.interaction import Interaction
-            
-            # Create interaction dict with user information
-            interaction_dict = {}
-            uid_field = self.dataset.uid_field
-            interaction_dict[uid_field] = torch.tensor([user_id], device=self.config['device'])
-            
-            # For sequential models, add item_id_list if needed
-            if hasattr(self.dataset, 'field2type') and 'item_id_list' in self.dataset.field2type:
-                # Get user's historical sequence
+        from recbole.data.interaction import Interaction
+        
+        # Create interaction dict with user information
+        interaction_dict = {}
+        uid_field = self.dataset.uid_field
+        interaction_dict[uid_field] = torch.tensor([user_id], device=self.config['device'])
+        
+        # For sequential models, add item_id_list if needed
+        
+        if hasattr(self.dataset, 'field2type') and self.iid_list_field in self.dataset.field2type:
+            # Use provided history or fall back to internal history
+            if history is not None:
+                hist_items = history
+            else:
                 hist_items = self.user2item_list_train.get(user_id, [])
-                if hist_items:
-                    # Pad or truncate to max_seq_length if needed
-                    max_seq_len = 50
-                    if len(hist_items) > max_seq_len:
-                        hist_items = hist_items[-max_seq_len:]
-                    # Ensure proper tensor shape [batch_size, seq_len]
-                    hist_tensor = torch.tensor([hist_items], dtype=torch.long, device=self.config['device'])
-                else:
-                    # Empty sequence with proper shape
-                    hist_tensor = torch.tensor([[0]], dtype=torch.long, device=self.config['device'])
-                interaction_dict['item_id_list'] = hist_tensor
-            
-            # Add other fields that might be required
-            # Length field for sequential models
-            if 'item_length' in getattr(self.dataset, 'field2type', {}):
+                
+            if hist_items:
+                # Pad or truncate to max_seq_length if needed
+                max_seq_len = 50
+                if len(hist_items) > max_seq_len:
+                    hist_items = hist_items[-max_seq_len:]
+                # Ensure proper tensor shape [batch_size, seq_len]
+                hist_tensor = torch.tensor([hist_items], dtype=torch.long, device=self.config['device'])
+            else:
+                # Empty sequence with proper shape
+                hist_tensor = torch.tensor([[0]], dtype=torch.long, device=self.config['device'])
+            interaction_dict[self.iid_list_field] = hist_tensor
+        
+        # Add other fields that might be required
+        # Length field for sequential models
+        if 'item_length' in getattr(self.dataset, 'field2type', {}):
+            if history is not None:
+                hist_len = len(history)
+            else:
                 hist_len = len(self.user2item_list_train.get(user_id, []))
-                interaction_dict['item_length'] = torch.tensor([hist_len], device=self.config['device'])
-            
-            # Create the Interaction object
-            return Interaction(interaction_dict)
-            
-        except Exception as e:
-            print(f"Warning: Failed to create interaction for user {user_id}: {e}")
-            return None
+            interaction_dict['item_length'] = torch.tensor([hist_len], device=self.config['device'])
+        
+        # Create the Interaction object
+        return Interaction(interaction_dict)
+
 
     def recall(self, user_id: int, topk: int, history: List[int]) -> List[int]:
         """Generate recommendations for a user
@@ -318,7 +323,7 @@ class RecBoleRecaller(BaseRecaller):
                 return []
             
             # Create proper Interaction object for this user
-            interaction = self._create_user_interaction(user_id)
+            interaction = self._create_user_interaction(user_id, history)
             if interaction is None:
                 return []
             

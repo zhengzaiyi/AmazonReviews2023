@@ -1,6 +1,7 @@
 cd seq_rec_results/dataset/
+# TODO: constant larger datasets
 python process_amazon_2023.py \
-    --domain All_Beauty \
+    --domain  Musical_Instruments \
     --device cuda:0 \
-    --plm hyp1231/blair-roberta-base
+    --plm bert-base-uncased
     

@@ -10,23 +10,15 @@ from GRPO.data import load_dataset
 from GRPO.recallers import RecBoleRecaller
 from GRPO.agents import UserProfileAgent, LLMRouterAgent
 
-def find_latest_checkpoint(model_name: str, checkpoint_dir: str) -> str:
-    import glob
-    pattern = os.path.join(checkpoint_dir, f"{model_name}-*.pth")
-    checkpoints = glob.glob(pattern)
-    if not checkpoints:
-        return ""
-    checkpoints.sort(key=os.path.getmtime, reverse=True)
-    return checkpoints[0]
 
-
-def create_recaller(model_name: str, dataset_name: str, checkpoint_dir: str, data_path: str, seed: int, use_latest_checkpoint: bool = True) -> RecBoleRecaller:
+def create_recaller(model_name: str, dataset_name: str, checkpoint_dir: str, data_path: str, seed: int, use_latest_checkpoint: bool = True, num_items: int = 0) -> RecBoleRecaller:
     """Create a recaller with proper configuration for the specified model"""
     
     # Find checkpoint if requested
-    checkpoint_path = ""
-    if use_latest_checkpoint:
-        checkpoint_path = find_latest_checkpoint(model_name, checkpoint_dir)
+    checkpoint_path = f"checkpoints/{dataset_name}"
+    if not os.path.exists(checkpoint_path):
+        os.makedirs(checkpoint_path)
+
     
     # Model-specific configurations
     model_configs = {
@@ -78,13 +70,15 @@ def create_recaller(model_name: str, dataset_name: str, checkpoint_dir: str, dat
         dataset_name=dataset_name,
         checkpoint_path=checkpoint_path,
         data_path=data_path,
-        config_dict=config_dict
+        config_dict=config_dict,
+        num_items=num_items
     )
     
     return recaller
 
 
-def initialize_recallers(model_names: List[str], dataset_name: str, checkpoint_dir: str, data_path: str, seed: int, use_latest_checkpoint: bool = True) -> dict:
+def initialize_recallers(
+    model_names: List[str], dataset_name: str, checkpoint_dir: str, data_path: str, seed: int, use_latest_checkpoint: bool = True, num_items: int = 0) -> dict:
     """Initialize all recallers with proper error handling"""
     
     recallers = {}
@@ -114,7 +108,8 @@ def initialize_recallers(model_names: List[str], dataset_name: str, checkpoint_d
             checkpoint_dir=checkpoint_dir,
             data_path=data_path,
             seed=seed,
-            use_latest_checkpoint=use_latest_checkpoint
+            use_latest_checkpoint=use_latest_checkpoint,
+            num_items=num_items
         )
         
         recallers[model_name.lower()] = recaller
@@ -129,7 +124,8 @@ def initialize_recallers(model_names: List[str], dataset_name: str, checkpoint_d
             checkpoint_dir=checkpoint_dir,
             data_path=data_path,
             seed=seed,
-            use_latest_checkpoint=False
+            use_latest_checkpoint=False,
+            num_items=num_items
         )
         recallers['pop'] = fallback_recaller
         print("✅ Fallback Pop recaller initialized")
@@ -140,7 +136,7 @@ def initialize_recallers(model_names: List[str], dataset_name: str, checkpoint_d
     print(f"📊 Total recallers initialized: {len(recallers)} ({list(recallers.keys())})")
     return recallers
 
-# TODO: device
+
 def main(argv: List[str] = None):
     ap = argparse.ArgumentParser(description='GRPO Training for Recommendation Systems')
     ap.add_argument('--dataset', type=str, default='ml-100k')
@@ -171,7 +167,8 @@ def main(argv: List[str] = None):
         checkpoint_dir=args.checkpoint_dir,
         data_path=args.data_path,
         seed=args.seed,
-        use_latest_checkpoint=args.use_latest_checkpoint
+        use_latest_checkpoint=args.use_latest_checkpoint,
+        num_items=inter.num_items
     )
     data_map_path = os.path.join(args.data_path, f'{args.dataset}', f'{args.dataset}.data_maps')
     reviews_path = os.path.join(args.data_path, f'{args.dataset}', f'{args.dataset}.reviews')
