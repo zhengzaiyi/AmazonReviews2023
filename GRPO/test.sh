@@ -10,5 +10,5 @@ python GRPO/main_trl.py \
     --dataset $1 \
     --data_path dataset \
     --recbole_models BPR ItemKNN FPMC Pop SASRec\
-    --do_test \
+    --do_test_recaller \
     --use_vllm

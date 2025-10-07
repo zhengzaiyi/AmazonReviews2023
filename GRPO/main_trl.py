@@ -27,7 +27,7 @@ from GRPO.utils import set_seed, build_prompt, multi_channel_recall, ndcg_at_k, 
 
 
 def create_trl_dataset(
-    profile_agent, 
+    profile_agent: UserProfileAgent, 
     user_ids: List[int],
     histories: List[List[int]],
     target_items: List[int],
@@ -37,7 +37,7 @@ def create_trl_dataset(
     dataset = []
     for i, uid in enumerate(user_ids):
         hist = histories[i]
-        prof_json = '' if profile_agent is None else profile_agent.forward(uid, hist).profile_json
+        prof_json = '' if profile_agent is None else profile_agent.forward(uid, hist)
         content = build_prompt(prof_json, list(recallers.keys()))
         dataset.append({
             "prompt": [{"role": "user", "content": content}],
@@ -57,7 +57,7 @@ def parse_args():
     ap.add_argument('--recbole_models', type=str, nargs='+', default=['BPR', 'SASRec', 'FPMC', 'Pop', 'ItemKNN'])
     ap.add_argument('--checkpoint_dir', type=str, default='./checkpoints')
     ap.add_argument('--use_hf_local', action='store_true')
-    ap.add_argument('--hf_model', type=str, default='google/gemma-3-1b-it')
+    ap.add_argument('--hf_model', type=str, default='meta-llama/Llama-3.2-1B-Instruct')
     ap.add_argument('--output_dir', type=str, default='GRPO/grpo_models')
     ap.add_argument('--do_train', action='store_true')
     ap.add_argument('--do_eval', action='store_true')
@@ -68,6 +68,7 @@ def parse_args():
     ap.add_argument('--lora_alpha', type=int, default=32, help='LoRA alpha')
     ap.add_argument('--lora_dropout', type=float, default=0.1, help='LoRA dropout')
     ap.add_argument('--use_peft', action='store_true', help='Whether to use PEFT')
+    ap.add_argument('--parallel_size', type=int, default=1, help='Parallel size')
     args = ap.parse_args()
     return args
 
@@ -79,10 +80,12 @@ def main():
     
     set_seed(args.seed)
 
-    assert args.do_train or args.do_eval or args.do_test, "At least one of --do_train, --do_eval, or --do_test must be True"
+    assert args.do_train or args.do_eval or args.do_test or args.do_test_recaller, "At least one of --do_train, --do_eval, or --do_test must be True"
     assert not (args.do_train and args.do_test), "Only one of --do_train or --do_test can be True"
 
-    inter_dataset = load_dataset(args.dataset, args.data_path, seed=args.seed)
+    inter_dataset = load_dataset(args.dataset, args.data_path, seed=args.seed)    
+    profile_agent = UserProfileAgent(inter_dataset, args.dataset)
+
     recallers = initialize_recallers(
         model_names=args.recbole_models,
         dataset_name=args.dataset,
@@ -90,17 +93,8 @@ def main():
         data_path=args.data_path,
         seed=args.seed,
         use_latest_checkpoint=True,
-        num_items=inter_dataset.num_items
+        num_items=inter_dataset.ds.item_num
     )
-    data_map_path = os.path.join(args.data_path, f'{args.dataset}', f'{args.dataset}.data_maps')
-    reviews_path = os.path.join(args.data_path, f'{args.dataset}', f'{args.dataset}.reviews')
-    with open(data_map_path, 'r') as f:
-        data_maps = json.load(f)
-    with open(reviews_path, 'r') as f:
-        reviews = json.load(f)
-    profile_agent = UserProfileAgent(inter_dataset.num_items, data_maps, reviews)
-    profile_agent = None
-
     model_config = create_model_config(
         available_models=list(recallers.keys()),
         default_configs=None,
@@ -119,7 +113,7 @@ def main():
             model = AutoModelForCausalLM.from_pretrained(
                 args.hf_model, 
                 trust_remote_code=True,
-                # device_map="auto"  
+                device_map="auto"  
             )
         def reward_func(completions, uid, histories, target_items, **kwargs):
             rewards = []
@@ -163,7 +157,7 @@ def main():
         use_vllm=args.use_vllm,
         vllm_mode="colocate",
         vllm_model_impl="vllm",
-        vllm_tensor_parallel_size=1,  # Each process uses only its assigned GPU
+        vllm_tensor_parallel_size=args.parallel_size,
         vllm_guided_decoding_json=model_config.model_json_schema(),
         # vllm_gpu_memory_utilization=0.5,  # Increase from default 0.3 to 0.8
     )
@@ -182,6 +176,7 @@ def main():
             reward_funcs=reward_func,
             args=grpo_config,
             train_dataset=trl_train_dataset,
+            processing_class=tokenizer,
             eval_dataset=create_trl_dataset(
                 profile_agent=profile_agent,
                 user_ids=inter_dataset.eval_user_ids,
@@ -194,7 +189,7 @@ def main():
         trainer.train()
     
     trl_test_dataset = create_trl_dataset(
-        profile_agent=profile_agent,
+        profile_agent=None if args.do_test_recaller else profile_agent,
         user_ids=inter_dataset.test_user_ids,
         histories=inter_dataset.test_histories,
         target_items=inter_dataset.test_target_items,

@@ -3,11 +3,13 @@ import math
 from typing import List, Optional, Union
 from dataclasses import dataclass
 from typing import Dict, List, Optional
+import numpy as np
 
 from GRPO.utils import ndcg_at_k
 from collections import defaultdict
 from pydantic.config import ConfigDict
 import outlines
+from tqdm import tqdm
 
 try:
     import dspy
@@ -23,17 +25,57 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, P
 from GRPO.utils import build_prompt
 from pydantic import BaseModel, Field, create_model
 from typing import Dict, List, Type
+from GRPO.data import InteractionData
+from recbole.data.dataset import SequentialDataset
+from GRPO.constant import dataset_feat_alias
 
 
 class UserProfileAgent:
-    # TODO: add summary of the user
     def __init__(
-        self, num_items: int, data_maps: Dict[str, Dict[str, str]], reviews: Dict[str, List[dict]]): 
-        self.num_items = num_items
-        self.data_maps = data_maps
-        self.item2id = data_maps['item2id']
-        self.id2meta = data_maps['id2meta']
-        self.reviews = self._preprocess_reviews(reviews)
+        self, 
+        inter_dataset: InteractionData,
+        dataset_name: str,
+        reviews: Dict[str, List[dict]] = None
+    ): 
+        self.num_items = inter_dataset.ds.item_num
+        self.inter_feat, self.item_feat, self.user_feat = {}, {}, {}
+        self.iid_field, self.uid_field = inter_dataset.ds.iid_field, inter_dataset.ds.uid_field
+        self.dataset_name = dataset_name
+        if inter_dataset.ds.user_feat is not None:
+            for row in tqdm(inter_dataset.ds.user_feat.iterrows(), desc='Preprocessing user_feat'):
+                row_dict = row[1].to_dict()
+                uid = int(row_dict.pop(self.uid_field))
+                self.user_feat[uid] = self._preprocess_feat(row_dict, inter_dataset.ds)
+        for row in tqdm(inter_dataset.ds.item_feat.iterrows(), desc='Preprocessing item_feat'):
+            row_dict = row[1].to_dict()
+            iid = int(row_dict.pop(self.iid_field))
+            self.item_feat[iid] = self._preprocess_feat(row_dict, inter_dataset.ds)
+        for row in tqdm(inter_dataset.ds.inter_feat.iterrows(), desc='Preprocessing inter_feat'):
+            row_dict = row[1].to_dict()
+            uid = int(row_dict.pop(self.uid_field))
+            iid = int(row_dict.pop(self.iid_field))
+            self.inter_feat[f'{uid}_{iid}'] = self._preprocess_feat(row_dict, inter_dataset.ds)
+        # TODO:self.reviews = self._preprocess_reviews(reviews)
+
+    def _preprocess_feat(self, feat: dict, ds: SequentialDataset):
+        field2id_token = ds.field2id_token
+        res = {}
+
+        def change_type(var):
+            if type(var) == float:
+                return int(var)
+            return var
+        for key in feat.keys():
+            if key not in field2id_token.keys():
+                res[key] = feat[key]
+            elif type(feat[key]) == np.ndarray:
+                res[key] = ' '.join([field2id_token[key][change_type(item)] for item in feat[key]])
+            else:
+                res[key] = field2id_token[key][change_type(feat[key])]
+            if key in dataset_feat_alias[self.dataset_name].keys():
+                res[key] = dataset_feat_alias[self.dataset_name][key][change_type(res[key])]
+        return res
+
 
     def _preprocess_reviews(self, reviews: List[dict]):
         processed_reviews = defaultdict(list)
@@ -52,17 +94,16 @@ class UserProfileAgent:
         return self.id2meta[str(item_id)]
 
     def forward(self, user_id: int, history: List[int]):
-        item_id_history = [self.item2id[item] for item in history]
-        user_profile_dict = {
-            "user id": int(user_id), 
-            "purchased item numbers": len(history),
-            "purchased items": [self._get_item_metadata(item_id) for item_id in history],
-            "last purchased item": self._get_item_metadata(history[-1]) if history else -1, 
-            "reviews": [review for review in self.reviews[user_id] if review["item"] in item_id_history],
-        }
-        class _Out:
-            def __init__(self, js): self.profile_json = js
-        return _Out(json.dumps(user_profile_dict))
+        user_profile_dict = {}
+        if user_id in self.user_feat.keys():
+            user_profile_dict['Demographic'] = self.user_feat[user_id]
+        user_profile_dict['purchased item numbers'] = len(history)
+        user_profile_dict['purchase history'] = [
+            {**self.item_feat[item_id], **self.inter_feat.get(f'{user_id}_{item_id}', {})} 
+            for item_id in history
+        ]
+        user_profile_dict['last purchased item'] = {**self.item_feat[history[-1]], **self.inter_feat.get(f'{user_id}_{history[-1]}', {})} if history else -1
+        return json.dumps(user_profile_dict, indent=4)
 
 
 class LLMRouterAgent:

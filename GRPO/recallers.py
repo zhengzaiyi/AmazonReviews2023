@@ -37,8 +37,23 @@ class RecBoleRecaller(BaseRecaller):
     def _get_model_config(self):
         """Get specific configuration for each model type"""
         # Base configuration
-        base_config = get_base_config_dict(self.dataset_name)
+        base_config = get_base_config_dict(self.dataset_name, self.data_path)
         # Model-specific configurations based on RecBole documentation
+        import os
+        import torch
+        
+        # # 检查是否在分布式环境中
+        # local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        # world_size = int(os.environ.get('WORLD_SIZE', 1))
+        
+        # # 为每个进程设置不同的设备
+        # if world_size > 1:
+        #     # 在分布式环境中，使用 LOCAL_RANK 作为设备 ID
+        #     base_config['device'] = f'cuda:{local_rank}'
+        # elif torch.cuda.is_available():
+        #     base_config['device'] = 'cuda'
+        # else:
+        #     base_config['device'] = 'cpu'
         if self.model_name == 'BPR':
             model_config = {
                 **base_config,
