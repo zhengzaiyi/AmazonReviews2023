@@ -158,9 +158,33 @@ def main():
         vllm_mode="colocate",
         vllm_model_impl="vllm",
         vllm_tensor_parallel_size=args.parallel_size,
-        vllm_guided_decoding_json=model_config.model_json_schema(),
-        # vllm_gpu_memory_utilization=0.5,  # Increase from default 0.3 to 0.8
+
+        adam_beta1=0.9,
+        adam_beta2=0.99,
+        beta=0.001,
+        per_device_train_batch_size=2,
+        per_device_eval_batch_size=2,
+        num_train_epochs=2,
+        # eval_strategy="steps",
+        # eval_steps=100,
+        save_strategy="steps",
+        save_steps=200,
+        logging_steps=10,
+        bf16=True,
+        gradient_accumulation_steps=3,
+        learning_rate=1e-6,
+        optim="paged_adamw_8bit",
+        lr_scheduler_type="constant",
+        vllm_gpu_memory_utilization=0.5,
+        seed=3407,
+        max_prompt_length=2048,
+        max_completion_length=1024,
+        num_generations=8,
+        gradient_checkpointing=True,
+        run_name="vanilla_" + f"_lr{1e-6}_kl{1e-3}",
+        report_to = "wandb"
     )
+    grpo_config.vllm_guided_decoding_json=model_config.model_json_schema()
 
     # Run training, evaluation, and testing
     if args.do_train:
