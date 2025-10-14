@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import math
 import json
-from typing import List, Dict
+from typing import List, Dict, Optional
 from collections import defaultdict
 from GRPO.recallers import RecBoleRecaller
 
@@ -222,6 +222,31 @@ def multi_channel_recall(
             recall_results.append([])
     return recall_results
 
+def average_recall(
+    recallers: Dict[str, RecBoleRecaller],
+    uid: List[int],
+    histories: List[List[int]],
+    final_k: int,
+    normalize: Optional[str] = None,
+) -> List[List[int]]:
+    recall_results = []
+    for i, user in enumerate(uid):
+        total_scores = 0
+        for recaller in recallers.keys():
+            scores = recallers[recaller].full_sort_predict(user, histories[i])
+            scores = torch.tensor(scores)
+            if normalize == 'sigmoid':
+                scores = torch.sigmoid(scores)
+            elif normalize == 'tanh':
+                scores = torch.tanh(scores)
+            elif normalize == 'softmax':
+                scores = torch.softmax(scores, dim=-1)
+            scores = scores.numpy()
+            total_scores = scores + total_scores
+        topk_indices = np.argsort(total_scores)[::-1][:final_k]
+        recall_results.append(topk_indices)
+    return recall_results
+
 def evaluate(
     completions: List[List[dict]], 
     uid: List[int], 
@@ -317,6 +342,8 @@ def evaluate_recallers(
 ) -> Dict[str, float]:
     metrics = {recaller: defaultdict(list) for recaller in recallers.keys()}
     metrics['optimal'] = defaultdict(list)
+    metrics['average'] = defaultdict(list)
+    metrics['static'] = defaultdict(list)
     all_recommendations = {recaller: [] for recaller in recallers.keys()}
     for i in range(len(uid)):
         for recaller_name in recallers.keys():
@@ -328,6 +355,27 @@ def evaluate_recallers(
                 recall = recall_at_k(item_ids, target_items[i], k=k)
                 metrics[recaller_name][f"ndcg@{k}"].append(ndcg)
                 metrics[recaller_name][f"recall@{k}"].append(recall)
+    
+    average_recall_results = average_recall(
+        recallers=recallers,
+        uid=uid,
+        histories=histories,
+        final_k=final_k,
+    )
+    static_recall_results = average_recall(
+        recallers=recallers,
+        uid=uid,
+        histories=histories,
+        final_k=final_k,
+        normalize='softmax'
+    )
+    
+    for i in range(len(uid)):
+        for k in ks:
+            metrics['average'][f"ndcg@{k}"].append(ndcg_at_k(average_recall_results[i], target_items[i], k=k))
+            metrics['average'][f"recall@{k}"].append(recall_at_k(average_recall_results[i], target_items[i], k=k))
+            metrics['static'][f"ndcg@{k}"].append(ndcg_at_k(static_recall_results[i], target_items[i], k=k))
+            metrics['static'][f"recall@{k}"].append(recall_at_k(static_recall_results[i], target_items[i], k=k))
     for i in range(len(uid)):
         last_k = 10
         best_ndcg = -1

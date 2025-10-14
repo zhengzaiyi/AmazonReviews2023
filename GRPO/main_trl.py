@@ -23,7 +23,7 @@ from GRPO.main import initialize_recallers
 from GRPO.recallers import BaseRecaller
 from GRPO.trl_trainer import GRPOTrainer
 from GRPO.utils import set_seed, build_prompt, multi_channel_recall, ndcg_at_k, evaluate, evaluate_recallers
-
+from accelerate import Accelerator
 
 
 def create_trl_dataset(
@@ -31,14 +31,16 @@ def create_trl_dataset(
     user_ids: List[int],
     histories: List[List[int]],
     target_items: List[int],
-    recallers: List[BaseRecaller]
+    recaller_names: List[str]
 ):
     """Create TRL dataset containing information needed for reward calculation"""
     dataset = []
     for i, uid in enumerate(user_ids):
         hist = histories[i]
+        if 0 in hist:
+            hist = hist[:hist.index(0)]
         prof_json = '' if profile_agent is None else profile_agent.forward(uid, hist)
-        content = build_prompt(prof_json, list(recallers.keys()))
+        content = build_prompt(prof_json, recaller_names)
         dataset.append({
             "prompt": [{"role": "user", "content": content}],
             "uid": uid,                           # User ID
@@ -62,6 +64,7 @@ def parse_args():
     ap.add_argument('--do_train', action='store_true')
     ap.add_argument('--do_eval', action='store_true')
     ap.add_argument('--do_test', action='store_true')
+    ap.add_argument('--do_test_rl', action='store_true')
     ap.add_argument('--do_test_recaller', action='store_true')
     ap.add_argument('--use_vllm', action='store_true')
     ap.add_argument('--lora_r', type=int, default=16, help='LoRA rank')
@@ -77,79 +80,27 @@ def main():
     if not args.use_hf_local:
         raise RuntimeError("TRL entrypoint requires --use_hf_local to provide a local HF model.")
     
-    
+    # accelerator = Acceleratosr()
     set_seed(args.seed)
 
     assert args.do_train or args.do_eval or args.do_test or args.do_test_recaller, "At least one of --do_train, --do_eval, or --do_test must be True"
     assert not (args.do_train and args.do_test), "Only one of --do_train or --do_test can be True"
 
-    inter_dataset = load_dataset(args.dataset, args.data_path, seed=args.seed)    
-    profile_agent = UserProfileAgent(inter_dataset, args.dataset)
-
-    recallers = initialize_recallers(
-        model_names=args.recbole_models,
-        dataset_name=args.dataset,
-        checkpoint_dir=args.checkpoint_dir,
-        data_path=args.data_path,
-        seed=args.seed,
-        use_latest_checkpoint=True,
-        num_items=inter_dataset.ds.item_num
-    )
-    model_config = create_model_config(
-        available_models=list(recallers.keys()),
-        default_configs=None,
-        class_name="ModelConfigs"
-    )
     
-    # Initialize HF models
-    tokenizer = AutoTokenizer.from_pretrained(args.hf_model, trust_remote_code=True)
-    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+
+    # peft_config = LoraConfig(
+    #     task_type=TaskType.CAUSAL_LM,
+    #     r=args.lora_r,
+    #     lora_alpha=args.lora_alpha,
+    #     lora_dropout=args.lora_dropout,
+    #     target_modules=["q_proj", "v_proj", "k_proj", "o_proj",
+    #                    "gate_proj", "up_proj", "down_proj"],
+    #     bias="none",
+    # )
+    # Create trainer config
     model_save_dir = f"{args.output_dir}/{args.dataset}"
     os.makedirs(model_save_dir, exist_ok=True)
-
-    if args.do_train:
-        if not args.use_vllm:
-            model = AutoModelForCausalLM.from_pretrained(
-                args.hf_model, 
-                trust_remote_code=True,
-                device_map="auto"  
-            )
-        def reward_func(completions, uid, histories, target_items, **kwargs):
-            rewards = []
-            recall_results = multi_channel_recall(
-                completions=completions, 
-                uid=uid, 
-                histories=histories, 
-                recallers=recallers, 
-                final_k=args.final_k
-            )
-            for i, recall_result in enumerate(recall_results):
-                ndcg = ndcg_at_k(recall_result, target_items[i], k=args.final_k)
-                rewards.append(ndcg)
-            return rewards
-    elif args.do_test:
-        last_checkpoint = get_last_checkpoint(model_save_dir)
-        model = outlines.from_transformers(
-            AutoModelForCausalLM.from_pretrained(
-                last_checkpoint if last_checkpoint is not None else args.hf_model,
-                trust_remote_code=True,
-                device_map="auto"  
-            ),
-            tokenizer
-        )
-
-    peft_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        target_modules=["q_proj", "v_proj", "k_proj", "o_proj",
-                       "gate_proj", "up_proj", "down_proj"],
-        bias="none",
-    )
-    # Create trainer config
-    
     grpo_config = GRPOConfig(
         output_dir=model_save_dir,
         save_total_limit=2,
@@ -175,26 +126,77 @@ def main():
         learning_rate=1e-6,
         optim="paged_adamw_8bit",
         lr_scheduler_type="constant",
-        vllm_gpu_memory_utilization=0.5,
+        vllm_gpu_memory_utilization=0.3,
         seed=3407,
         max_prompt_length=2048,
         max_completion_length=1024,
-        num_generations=8,
+        generation_batch_size=16,
+        num_generations=4,
         gradient_checkpointing=True,
         run_name="vanilla_" + f"_lr{1e-6}_kl{1e-3}",
         report_to = "wandb"
     )
-    grpo_config.vllm_guided_decoding_json=model_config.model_json_schema()
+    
+    
 
+    inter_dataset = load_dataset(args.dataset, args.data_path, seed=args.seed) 
+    profile_agent = UserProfileAgent(inter_dataset, args.dataset)
+    trl_train_dataset = create_trl_dataset(
+            profile_agent=profile_agent,
+            user_ids=inter_dataset.train_user_ids[:1000],
+            histories=inter_dataset.train_histories[:1000],
+            target_items=inter_dataset.train_target_items[:1000],
+            recaller_names=[model_name.lower() for model_name in args.recbole_models]
+        )
+    trl_test_dataset = create_trl_dataset(
+        profile_agent=None if args.do_test_recaller else profile_agent,
+        user_ids=inter_dataset.test_user_ids[:1000],
+        histories=inter_dataset.test_histories[:1000],
+        target_items=inter_dataset.test_target_items[:1000],
+        recaller_names=[model_name.lower() for model_name in args.recbole_models]
+    )
+    
+    recallers = initialize_recallers(
+        model_names=args.recbole_models,
+        dataset_name=args.dataset,
+        checkpoint_dir=args.checkpoint_dir,
+        data_path=args.data_path,
+        seed=args.seed,
+        use_latest_checkpoint=True,
+        num_items=inter_dataset.ds.item_num
+    )
+    model_config = create_model_config(
+        available_models=[model_name.lower() for model_name in args.recbole_models],
+        default_configs=None,
+        class_name="ModelConfigs"
+    )
+    grpo_config.vllm_guided_decoding_json=model_config.model_json_schema()
+    # Initialize HF models
+    tokenizer = AutoTokenizer.from_pretrained(args.hf_model, trust_remote_code=True)
+    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    # accelerator.wait_for_everyone()
     # Run training, evaluation, and testing
     if args.do_train:
-        trl_train_dataset = create_trl_dataset(
-            profile_agent=profile_agent,
-            user_ids=inter_dataset.train_user_ids,
-            histories=inter_dataset.train_histories,
-            target_items=inter_dataset.train_target_items,
-            recallers=recallers
-        )
+        if not args.use_vllm:
+            model = AutoModelForCausalLM.from_pretrained(
+                args.hf_model, 
+                trust_remote_code=True,
+                device_map="auto"  
+            )
+        def reward_func(completions, uid, histories, target_items, **kwargs):
+            rewards = []
+            recall_results = multi_channel_recall(
+                completions=completions, 
+                uid=uid, 
+                histories=histories, 
+                recallers=recallers, 
+                final_k=args.final_k
+            )
+            for i, recall_result in enumerate(recall_results):
+                ndcg = ndcg_at_k(recall_result, target_items[i], k=args.final_k)
+                rewards.append(ndcg)
+            return rewards
         trainer = GRPOTrainer(
             model=args.hf_model if args.use_vllm else model,
             reward_funcs=reward_func,
@@ -208,24 +210,28 @@ def main():
                 target_items=inter_dataset.eval_target_items,
                 recallers=recallers
             ) if args.do_eval else None,
-            peft_config=peft_config if args.use_peft else None,
+            # peft_config=peft_config if args.use_peft else None,
         )
         trainer.train()
-    
-    trl_test_dataset = create_trl_dataset(
-        profile_agent=None if args.do_test_recaller else profile_agent,
-        user_ids=inter_dataset.test_user_ids,
-        histories=inter_dataset.test_histories,
-        target_items=inter_dataset.test_target_items,
-        recallers=recallers
-    )
+        # accelerator.wait_for_everyone()
     
     if args.do_test:
+        last_checkpoint = get_last_checkpoint(model_save_dir)
+        model = outlines.from_transformers(
+            AutoModelForCausalLM.from_pretrained(
+                last_checkpoint if args.do_test_rl else args.hf_model,
+                trust_remote_code=True,
+                device_map="auto"  
+            ),
+            tokenizer
+        )
         completions = []
         for i in tqdm(range(len(trl_test_dataset))):
             prompts = trl_test_dataset[i]['prompt'][0]['content']
             completions.append(model(prompts, model_config, max_new_tokens=200))
-
+        import pickle
+        with open(f"completions_{args.dataset}.pkl", "wb") as f:
+            pickle.dump(completions, f)
         metrics = evaluate(
             completions=completions,
             uid=trl_test_dataset["uid"],

@@ -23,6 +23,7 @@ export WANDB_MODE=disabled
 
 # 运行命令
 cd /home/zzheng3/AmazonReviews2023
+# export CUDA_VISIBLE_DEVICES=$2
 # python GRPO/main_trl.py \
 #     --use_hf_local \
 #     --dataset $1 \
@@ -32,22 +33,15 @@ cd /home/zzheng3/AmazonReviews2023
 #     --hf_model meta-llama/Llama-3.2-1B-Instruct
 
 PARALLEL_SIZE=1
-torchrun --nproc_per_node=4 GRPO/main_trl.py \
+# export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=4,5,6,7
+
+accelerate launch --config_file GRPO/acc.yaml\
+    GRPO/main_trl.py \
     --use_hf_local \
     --dataset $1 \
     --data_path dataset \
+    --parallel_size 2 \
     --do_train \
     --use_vllm \
-    --parallel_size $PARALLEL_SIZE \
     --hf_model meta-llama/Llama-3.2-1B-Instruct
-
-
-# accelerate launch --config_file ref/grpo.yaml\
-#     GRPO/main_trl.py \
-#     --use_hf_local \
-#     --dataset $DATASET \
-#     --data_path dataset \
-#     --parallel_size $PARALLEL_SIZE \
-#     --do_train \
-#     --use_vllm \
-#     --hf_model Qwen/Qwen2.5-0.5B

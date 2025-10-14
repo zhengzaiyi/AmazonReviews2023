@@ -2,7 +2,7 @@ dataset2item_feat_fields = {
     'ml-1m': ['item_id', 'movie_title', 'release_year', 'genres'],
     'ml-10m': ['item_id', 'movie_title', 'release_year', 'genres'],
     'Food': ['item_id', 'name', 'submitted_timestamp', 'contributor_id', 'n_steps', 'minutes', 'nutrition', 'tags'],
-    'steam': ['id', 'app_name', 'developer', 'early_access', 'genres', 'metascore', 'price', 'publisher', 'timestamp', 'sentiment', 'specs', 'tags', 'title'],
+    'steam': ['product_id', 'app_name', 'developer', 'early_access', 'genres', 'metascore', 'price', 'publisher', 'timestamp', 'sentiment', 'specs', 'tags', 'title'],
     'yelp2022': ['item_id', 'item_name', 'address', 'city', 'state', 'postal_code', 'latitude', 'longitude', 'item_stars', 'item_review_count', 'is_open', 'categories'],
     'Amazon_Toys_and_Games': ['item_id', 'categories', 'average_rating', 'rating_number', 'price'],
     'Amazon_Musical_Instruments': ['item_id', 'categories', 'average_rating', 'rating_number', 'price'],

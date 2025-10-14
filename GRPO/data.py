@@ -37,7 +37,7 @@ def get_base_config_dict(dataset_name: str, data_path: str = 'dataset', seed: in
         'seed': seed,
         'load_col': {
             'inter': dataset2inter_feat_fields[dataset_name], # required
-            'item': dataset2item_feat_fields[dataset_name], # required
+            # 'item': dataset2item_feat_fields[dataset_name], # required
         },
         'user_inter_num_interval': "[5,inf)",
         'item_inter_num_interval': "[5,inf)",
@@ -98,6 +98,7 @@ def load_dataset(dataset: str, data_path: str, seed: int = 42, filter_train: boo
         uids_sorted = uids[order]
         _, counts = np.unique(uids_sorted, return_counts=True)
         last_pos = np.cumsum(counts) - 1                   # 每个 uid 的最后位置（在 uids_sorted 中的下标）
+        # last_pos = max(np.cumsum(counts) - 1, 1)
         keep_indices_sorted = order[last_pos]              # 映射回原始样本下标
 
         # 构造布尔掩码并切片出过滤后的 Interaction

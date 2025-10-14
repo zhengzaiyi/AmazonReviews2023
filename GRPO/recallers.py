@@ -313,6 +313,22 @@ class RecBoleRecaller(BaseRecaller):
         return Interaction(interaction_dict)
 
 
+    def full_sort_predict(self, user_id: int, history: List[int]) -> torch.Tensor:
+        interaction = self._create_user_interaction(user_id, history)
+        self.model.eval()
+        with torch.no_grad():
+            # Check if model supports full sort prediction
+            if not hasattr(self.model, 'full_sort_predict'):
+                return np.ndarray([])
+            
+            # Generate scores for all items using proper Interaction object
+            scores = self.model.full_sort_predict(interaction)
+            if scores.dim() > 1:
+                scores_np = scores[0].cpu().numpy().flatten()  # Take first batch element
+            else:
+                scores_np = scores.cpu().numpy().flatten()
+        return scores_np
+
     def recall(self, user_id: int, topk: int, history: List[int]) -> List[int]:
         """Generate recommendations for a user
         

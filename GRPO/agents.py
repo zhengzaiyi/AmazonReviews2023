@@ -11,11 +11,6 @@ from pydantic.config import ConfigDict
 import outlines
 from tqdm import tqdm
 
-try:
-    import dspy
-    DSPY_OK = True
-except Exception:
-    DSPY_OK = False
 
 import torch
 import torch.nn as nn
@@ -46,10 +41,14 @@ class UserProfileAgent:
                 row_dict = row[1].to_dict()
                 uid = int(row_dict.pop(self.uid_field))
                 self.user_feat[uid] = self._preprocess_feat(row_dict, inter_dataset.ds)
-        for row in tqdm(inter_dataset.ds.item_feat.iterrows(), desc='Preprocessing item_feat'):
+        import pandas as pd
+        item_feat_pd = pd.read_csv(f'dataset/{self.dataset_name}/{self.dataset_name}.item', sep='\t')
+        item_feat_pd.columns = item_feat_pd.columns.str.split(':').str[0]
+        for row in tqdm(item_feat_pd.iterrows(), desc='Preprocessing item_feat'):
             row_dict = row[1].to_dict()
-            iid = int(row_dict.pop(self.iid_field))
-            self.item_feat[iid] = self._preprocess_feat(row_dict, inter_dataset.ds)
+            itoken = row_dict.pop(self.iid_field)
+            if str(itoken) in inter_dataset.ds.field2token_id[self.iid_field].keys():
+                self.item_feat[inter_dataset.ds.field2token_id[self.iid_field][str(itoken)]] = self._preprocess_feat(row_dict, inter_dataset.ds)
         for row in tqdm(inter_dataset.ds.inter_feat.iterrows(), desc='Preprocessing inter_feat'):
             row_dict = row[1].to_dict()
             uid = int(row_dict.pop(self.uid_field))
@@ -102,7 +101,6 @@ class UserProfileAgent:
             {**self.item_feat[item_id], **self.inter_feat.get(f'{user_id}_{item_id}', {})} 
             for item_id in history
         ]
-        user_profile_dict['last purchased item'] = {**self.item_feat[history[-1]], **self.inter_feat.get(f'{user_id}_{history[-1]}', {})} if history else -1
         return json.dumps(user_profile_dict, indent=4)
 
 
