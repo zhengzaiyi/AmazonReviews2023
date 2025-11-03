@@ -14,19 +14,20 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.trainer_utils import get_last_checkpoint
-from trl import GRPOConfig
+from trl import GRPOConfig, SFTTrainer, SFTConfig
 from vllm.sampling_params import GuidedDecodingParams
 
 from GRPO.agents import UserProfileAgent, LLMRouterAgent, create_model_config
 from GRPO.data import load_dataset
 from GRPO.main import initialize_recallers
-from GRPO.recallers import BaseRecaller
+from GRPO.recallers import RecBoleRecaller
 from GRPO.trl_trainer import GRPOTrainer
-from GRPO.utils import set_seed, build_prompt, multi_channel_recall, ndcg_at_k, evaluate, evaluate_recallers
+from GRPO.utils import set_seed, build_prompt, multi_channel_recall, ndcg_at_k, evaluate, evaluate_recallers, recall_at_k
 from accelerate import Accelerator
+from collections import defaultdict
 
 
-def create_trl_dataset(
+def create_rl_dataset(
     profile_agent: UserProfileAgent, 
     user_ids: List[int],
     histories: List[List[int]],
@@ -40,7 +41,7 @@ def create_trl_dataset(
         if 0 in hist:
             hist = hist[:hist.index(0)]
         prof_json = '' if profile_agent is None else profile_agent.forward(uid, hist)
-        content = build_prompt(prof_json, recaller_names)
+        content = build_prompt(prof_json, recaller_names) if profile_agent is not None else recaller_names
         dataset.append({
             "prompt": [{"role": "user", "content": content}],
             "uid": uid,                           # User ID
@@ -49,6 +50,65 @@ def create_trl_dataset(
         })
     return Dataset.from_list(dataset)
 
+def create_sft_dataset(
+    profile_agent: UserProfileAgent, 
+    user_ids: List[int],
+    histories: List[List[int]],
+    target_items: List[int],
+    recallers: List[RecBoleRecaller],
+    final_k: int,
+    norm_type: str = 'static', # oracle, static
+):
+    dataset = []
+    metrics = {recaller: defaultdict(list) for recaller in recallers.keys()}
+    for i, uid in enumerate(user_ids):
+        hist = histories[i]
+        if 0 in hist:
+            hist = hist[:hist.index(0)]
+        best_ndcg, best_recaller = -1, None
+        for recaller_name in recallers.keys():
+            items = recallers[recaller_name].recall(uid, int(final_k), histories[i])
+            item_ids = [item[0] for item in items] if items else []
+            metrics[recaller_name]["ndcg"].append(ndcg_at_k(item_ids, [target_items[i]], k=final_k))
+            metrics[recaller_name]["recall@10"].append(recall_at_k(item_ids, [target_items[i]], k=10))
+            if metrics[recaller_name]["ndcg"][-1] > best_ndcg:
+                best_ndcg = metrics[recaller_name]["ndcg"][-1]
+                best_recaller = recaller_name
+        assert best_recaller is not None
+        prompt = build_prompt(profile_agent.forward(user_ids[i], hist), available_models=recallers.keys())
+        if norm_type == 'oracle':
+            ground_truth_output = {
+                recaller_name: {
+                    "top-k": final_k if recaller_name == best_recaller else 0,
+                    "score-weight": 1.0 if recaller_name == best_recaller else 0.0
+                } for recaller_name in recallers.keys()
+            }
+        elif norm_type == 'static':
+            recaller_scores = {name: ndcg_at_k([item[0] for item in items], target_items[i], k=final_k) 
+                            if (items := recallers[name].recall(user_ids[i], final_k, histories[i])) else 0
+                            for name in recallers.keys()}
+            
+            import numpy as np
+            scores = np.array(list(recaller_scores.values()))
+            weights = np.exp(scores * 2) / np.exp(scores * 2).sum()  # softmax with temperature=0.5
+            weights = weights * 0.9 + np.random.dirichlet(np.ones(len(weights))) * 0.1  # 10% noise
+
+            total_k = int(final_k * 1.5)
+            k_values = np.maximum(5, (weights * total_k).astype(int))
+            k_values = (k_values * min(1, total_k / k_values.sum())).astype(int)
+            
+            ground_truth_output = {
+                name: {"top-k": int(k), "score-weight": float(w)}
+                for name, k, w in zip(recaller_scores.keys(), k_values, weights/weights.sum())
+            }
+        else:
+            raise ValueError(f"Invalid norm type: {norm_type}")
+        ground_truth_output = json.dumps(ground_truth_output, indent=2)
+        dataset.append({
+            "prompt": prompt + '\n\n',
+            "completion": ground_truth_output,
+        })
+    return Dataset.from_list(dataset)
 
 def parse_args():
     ap = argparse.ArgumentParser(description='GRPO Training (TRL) for Recommendation Systems')
@@ -61,9 +121,10 @@ def parse_args():
     ap.add_argument('--use_hf_local', action='store_true')
     ap.add_argument('--hf_model', type=str, default='meta-llama/Llama-3.2-1B-Instruct')
     ap.add_argument('--output_dir', type=str, default='GRPO/grpo_models')
-    ap.add_argument('--do_train', action='store_true')
+    ap.add_argument('--do_rl', action='store_true')
     ap.add_argument('--do_eval', action='store_true')
     ap.add_argument('--do_test', action='store_true')
+    ap.add_argument('--do_test_sft', action='store_true')
     ap.add_argument('--do_test_rl', action='store_true')
     ap.add_argument('--do_test_recaller', action='store_true')
     ap.add_argument('--use_vllm', action='store_true')
@@ -72,6 +133,8 @@ def parse_args():
     ap.add_argument('--lora_dropout', type=float, default=0.1, help='LoRA dropout')
     ap.add_argument('--use_peft', action='store_true', help='Whether to use PEFT')
     ap.add_argument('--parallel_size', type=int, default=1, help='Parallel size')
+    ap.add_argument('--gen_sft_data', action='store_true')
+    ap.add_argument('-df', '--do_sft', action='store_true')
     args = ap.parse_args()
     return args
 
@@ -82,48 +145,36 @@ def main():
     
     # accelerator = Acceleratosr()
     set_seed(args.seed)
-
-    assert args.do_train or args.do_eval or args.do_test or args.do_test_recaller, "At least one of --do_train, --do_eval, or --do_test must be True"
-    assert not (args.do_train and args.do_test), "Only one of --do_train or --do_test can be True"
-
-    
-
-
-    # peft_config = LoraConfig(
-    #     task_type=TaskType.CAUSAL_LM,
-    #     r=args.lora_r,
-    #     lora_alpha=args.lora_alpha,
-    #     lora_dropout=args.lora_dropout,
-    #     target_modules=["q_proj", "v_proj", "k_proj", "o_proj",
-    #                    "gate_proj", "up_proj", "down_proj"],
-    #     bias="none",
-    # )
-    # Create trainer config
-    model_save_dir = f"{args.output_dir}/{args.dataset}"
+    model_save_dir = f"{args.output_dir}/{args.dataset}/{args.hf_model.split('/')[-1]}"
     os.makedirs(model_save_dir, exist_ok=True)
+    
+    inter_dataset = load_dataset(args.dataset, args.data_path, seed=args.seed) 
+    profile_agent = UserProfileAgent(inter_dataset, args.dataset)
+    cut_off_users = min(len(inter_dataset.train_user_ids), 1000)
+    model_config = create_model_config(
+        available_models=[model_name.lower() for model_name in args.recbole_models],
+        default_configs=None,
+        class_name="ModelConfigs"
+    )
     grpo_config = GRPOConfig(
         output_dir=model_save_dir,
-        save_total_limit=2,
-        
+        save_steps=500,
+        save_total_limit=10,   
         use_vllm=args.use_vllm,
         vllm_mode="colocate",
         vllm_model_impl="vllm",
         vllm_tensor_parallel_size=args.parallel_size,
-
+        # model_init_kwargs={
+        #     "load_in_8bit": True,
+        # },
         adam_beta1=0.9,
         adam_beta2=0.99,
         beta=0.001,
         per_device_train_batch_size=2,
         per_device_eval_batch_size=2,
-        num_train_epochs=2,
-        # eval_strategy="steps",
-        # eval_steps=100,
-        save_strategy="steps",
-        save_steps=200,
-        logging_steps=10,
-        bf16=True,
         gradient_accumulation_steps=3,
-        learning_rate=1e-6,
+        num_train_epochs=3,
+        learning_rate=1e-5,
         optim="paged_adamw_8bit",
         lr_scheduler_type="constant",
         vllm_gpu_memory_utilization=0.3,
@@ -133,57 +184,90 @@ def main():
         generation_batch_size=16,
         num_generations=4,
         gradient_checkpointing=True,
-        run_name="vanilla_" + f"_lr{1e-6}_kl{1e-3}",
+        run_name="vanilla_" + f"_lr{1e-5}_kl{1e-3}",
         report_to = "wandb"
     )
-    
-    
-
-    inter_dataset = load_dataset(args.dataset, args.data_path, seed=args.seed) 
-    profile_agent = UserProfileAgent(inter_dataset, args.dataset)
-    trl_train_dataset = create_trl_dataset(
-            profile_agent=profile_agent,
-            user_ids=inter_dataset.train_user_ids[:1000],
-            histories=inter_dataset.train_histories[:1000],
-            target_items=inter_dataset.train_target_items[:1000],
-            recaller_names=[model_name.lower() for model_name in args.recbole_models]
-        )
-    trl_test_dataset = create_trl_dataset(
-        profile_agent=None if args.do_test_recaller else profile_agent,
-        user_ids=inter_dataset.test_user_ids[:1000],
-        histories=inter_dataset.test_histories[:1000],
-        target_items=inter_dataset.test_target_items[:1000],
-        recaller_names=[model_name.lower() for model_name in args.recbole_models]
-    )
-    
-    recallers = initialize_recallers(
-        model_names=args.recbole_models,
-        dataset_name=args.dataset,
-        checkpoint_dir=args.checkpoint_dir,
-        data_path=args.data_path,
-        seed=args.seed,
-        use_latest_checkpoint=True,
-        num_items=inter_dataset.ds.item_num
-    )
-    model_config = create_model_config(
-        available_models=[model_name.lower() for model_name in args.recbole_models],
-        default_configs=None,
-        class_name="ModelConfigs"
-    )
     grpo_config.vllm_guided_decoding_json=model_config.model_json_schema()
+    if args.gen_sft_data or args.do_rl or args.do_eval or args.do_test or args.do_test_rl or args.do_test_recaller:
+        recallers = initialize_recallers(
+            model_names=args.recbole_models,
+            dataset_name=args.dataset,
+            checkpoint_dir=args.checkpoint_dir,
+            data_path=args.data_path,
+            seed=args.seed,
+            use_latest_checkpoint=True,
+            num_items=inter_dataset.ds.item_num
+        )
     # Initialize HF models
     tokenizer = AutoTokenizer.from_pretrained(args.hf_model, trust_remote_code=True)
+    tokenizer.padding_side = "right"
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     # accelerator.wait_for_everyone()
     # Run training, evaluation, and testing
-    if args.do_train:
-        if not args.use_vllm:
-            model = AutoModelForCausalLM.from_pretrained(
-                args.hf_model, 
-                trust_remote_code=True,
-                device_map="auto"  
+    model_name = args.hf_model
+    if args.gen_sft_data:
+        # separatelt generate sft data to avoid gpu id conflict
+        assert not args.do_sft and not args.do_rl and not args.do_eval and not args.do_test and not args.do_test_rl and not args.do_test_recaller
+        sft_dataset = create_sft_dataset(
+            profile_agent=profile_agent,
+            user_ids=inter_dataset.train_user_ids[:cut_off_users],
+            histories=inter_dataset.train_histories[:cut_off_users],
+            target_items=inter_dataset.train_target_items[:cut_off_users],
+            recallers=recallers,
+            final_k=args.final_k
+        )
+        if os.path.exists(f'{model_save_dir}_sft_data'):
+            os.rmtree(f'{model_save_dir}_sft_data')
+        sft_dataset.save_to_disk(f'{model_save_dir}_sft_data')
+        return
+    if args.do_sft:
+        # if len(os.listdir(f'{model_save_dir}_sft')) == 0:
+        model_save_dir = f"{model_save_dir}_sft"
+        if not os.path.exists(model_save_dir) or len(os.listdir(model_save_dir)) == 0:
+            sft_config = SFTConfig(
+                output_dir=model_save_dir,
+                save_total_limit=2,
+                per_device_train_batch_size=2,
+                per_device_eval_batch_size=2,
+                num_train_epochs=10,
+                save_strategy="steps",
+                save_steps=200,
+                logging_steps=10,
+                bf16=True,
+                gradient_accumulation_steps=3,
+                learning_rate=1e-5,
+                # optim="paged_adamw_8bit",
+                # lr_scheduler_type="constant",
+                seed=3407,
+                max_length=2048,
+                gradient_checkpointing=True,
+                run_name="sft_" + f"_lr{1e-5}",
+                report_to="wandb",
+                # completion_only_loss=True
             )
+            sft_dataset = Dataset.load_from_disk(f'{model_save_dir}_data')
+            trainer = SFTTrainer(
+                model=model_name, 
+                train_dataset=sft_dataset, 
+                processing_class=tokenizer, 
+                args=sft_config,
+                # load_in_8bit=True,
+                # tokenizer=tokenizer,
+                # formatting_func=lambda e: [e["prompt"] + e["completion"]],
+            )
+            trainer.train()
+        model_name = get_last_checkpoint(model_save_dir)          
+    if args.do_rl:
+        trl_train_dataset = create_rl_dataset(
+            profile_agent=profile_agent,
+            user_ids=inter_dataset.train_user_ids[:cut_off_users],
+            histories=inter_dataset.train_histories[:cut_off_users],
+            target_items=inter_dataset.train_target_items[:cut_off_users],
+            recaller_names=[model_name.lower() for model_name in args.recbole_models]
+        )
+        model_save_dir = f"{model_save_dir}_rl"
+        grpo_config.output_dir = model_save_dir
         def reward_func(completions, uid, histories, target_items, **kwargs):
             rewards = []
             recall_results = multi_channel_recall(
@@ -198,12 +282,12 @@ def main():
                 rewards.append(ndcg)
             return rewards
         trainer = GRPOTrainer(
-            model=args.hf_model if args.use_vllm else model,
+            model=model_name,
             reward_funcs=reward_func,
             args=grpo_config,
             train_dataset=trl_train_dataset,
             processing_class=tokenizer,
-            eval_dataset=create_trl_dataset(
+            eval_dataset=create_rl_dataset(
                 profile_agent=profile_agent,
                 user_ids=inter_dataset.eval_user_ids,
                 histories=inter_dataset.eval_histories,
@@ -213,15 +297,26 @@ def main():
             # peft_config=peft_config if args.use_peft else None,
         )
         trainer.train()
-        # accelerator.wait_for_everyone()
-    
+        # accelerator.wait_for_everyone() 
     if args.do_test:
-        last_checkpoint = get_last_checkpoint(model_save_dir)
+        trl_test_dataset = create_rl_dataset(
+            profile_agent=profile_agent,
+            user_ids=inter_dataset.test_user_ids[:cut_off_users],
+            histories=inter_dataset.test_histories[:cut_off_users],
+            target_items=inter_dataset.test_target_items[:cut_off_users],
+            recaller_names=[model_name.lower() for model_name in args.recbole_models]
+        )
+        if args.do_test_sft or args.do_test_rl:
+            model_save_dir = f"{model_save_dir}_sft" if args.do_test_sft else f"{model_save_dir}"
+            model_save_dir = f"{model_save_dir}_rl" if args.do_test_rl else model_save_dir
+            model_name = get_last_checkpoint(model_save_dir)
         model = outlines.from_transformers(
             AutoModelForCausalLM.from_pretrained(
-                last_checkpoint if args.do_test_rl else args.hf_model,
-                trust_remote_code=True,
-                device_map="auto"  
+                model_name, 
+                trust_remote_code=True, 
+                device_map="auto", 
+                torch_dtype=torch.float16
+                # load_in_8bit=True
             ),
             tokenizer
         )
@@ -230,7 +325,9 @@ def main():
             prompts = trl_test_dataset[i]['prompt'][0]['content']
             completions.append(model(prompts, model_config, max_new_tokens=200))
         import pickle
-        with open(f"completions_{args.dataset}.pkl", "wb") as f:
+        with open(f"completions/completions_{args.dataset}_"
+          f"{'_'.join(k for k, v in vars(args).items() if isinstance(v, bool) and v)}"
+          f".pkl", "wb") as f:
             pickle.dump(completions, f)
         metrics = evaluate(
             completions=completions,
@@ -243,6 +340,13 @@ def main():
         )
         print(json.dumps({"multi_channel_metrics": metrics}, indent=4))
     if args.do_test_recaller:
+        trl_test_dataset = create_rl_dataset(
+            profile_agent=None,
+            user_ids=inter_dataset.test_user_ids[:cut_off_users],
+            histories=inter_dataset.test_histories[:cut_off_users],
+            target_items=inter_dataset.test_target_items[:cut_off_users],
+            recaller_names=[model_name.lower() for model_name in args.recbole_models]
+        )
         recaller_metrics = evaluate_recallers(
             recallers=recallers,
             uid=trl_test_dataset["uid"],

@@ -16,6 +16,7 @@ try:
     RECB = True
 except Exception:
     RECB = False
+from datasets import Dataset
 
 
 @dataclass
@@ -51,6 +52,8 @@ def get_base_config_dict(dataset_name: str, data_path: str = 'dataset', seed: in
             'order': 'TO',
             'group_by': 'user'
         },
+        'save_dataset': True,
+        'save_dataloaders': True,
     }
     if dataset2user_feat_fields[dataset_name] is not None:
         config_dict['load_col']['user'] = dataset2user_feat_fields[dataset_name] # optional
@@ -96,10 +99,15 @@ def load_dataset(dataset: str, data_path: str, seed: int = 42, filter_train: boo
         # 然后取每个 uid 在排序后出现的最后一个位置（即最大 length；若并列取最后一条）
         order = np.lexsort((idx, lengths, uids))           # 先按 uid，再按 length，再按原始 idx
         uids_sorted = uids[order]
-        _, counts = np.unique(uids_sorted, return_counts=True)
-        last_pos = np.cumsum(counts) - 1                   # 每个 uid 的最后位置（在 uids_sorted 中的下标）
-        # last_pos = max(np.cumsum(counts) - 1, 1)
-        keep_indices_sorted = order[last_pos]              # 映射回原始样本下标
+        # 获取每个用户的起始位置和计数
+        unique_uids, first_pos, counts = np.unique(uids_sorted, return_index=True, return_counts=True)
+        
+        selected_positions = []
+        for i, (start, count) in enumerate(zip(first_pos, counts)):
+            pos_in_user = min(int(count * 0.7), count - 1)
+            selected_positions.append(start + pos_in_user)
+        
+        keep_indices_sorted = order[selected_positions]     # 映射回原始样本下标
 
         # 构造布尔掩码并切片出过滤后的 Interaction
         keep_mask = np.zeros(n, dtype=bool)
@@ -128,3 +136,4 @@ def load_dataset(dataset: str, data_path: str, seed: int = 42, filter_train: boo
         test_item_id_lists.tolist(), 
         test_item_ids.tolist(),
     )
+

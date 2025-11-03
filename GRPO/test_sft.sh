@@ -9,6 +9,7 @@ python GRPO/main_trl.py \
     --use_hf_local \
     --dataset $1 \
     --data_path dataset \
-    --recbole_models BPR ItemKNN FPMC Pop SASRec LightGCN SimpleX\
-    --do_test_recaller \
+    --recbole_models BPR ItemKNN FPMC Pop SASRec\
+    --do_test \
+    --do_test_sft\
     --use_vllm

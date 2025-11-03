@@ -17,6 +17,8 @@ def ndcg_at_k(rec_list: List[int], gt_items: List[int], k: int) -> float:
     """Calculate NDCG@K (Normalized Discounted Cumulative Gain)"""
     if not gt_items: return 0.0
     k = max(1, k)
+    if type(gt_items) == int:
+        gt_items = [gt_items]
     gt = set(gt_items)
     
     # Calculate DCG@K
@@ -124,8 +126,8 @@ def build_prompt(profile_json: str, available_models: List[str] = None) -> str:
     import random
     example_output = {
         model: {
-            "top-k": random.randint(10, 100),
-            "score-weight": round(random.uniform(0.1, 1.0), 4)
+            "top-k": f'integer between 1 and 500',
+            "score-weight": f'float between 0 and 1'
         } for model in available_models
     }
     example_output = json.dumps(example_output, indent=2)
@@ -134,9 +136,9 @@ def build_prompt(profile_json: str, available_models: List[str] = None) -> str:
         "You are a multi-channel recall assistant in a recommendation system. Given a user profile JSON, "
         "output ONLY a JSON file describe the usage of different models during the multi-channel recall. Each element must be an object with keys: "
         "\"name\" (string: model name like '"
-        + models_str + "'), \"k\" (int 1..500: number of items), \"weight\" (float 0..1: model weight)\n\n"
+        + models_str + "'), \"k\" (integer between 1 and 500: number of items), \"weight\" (float between 0 and 1: model weight)\n\n"
         f"Available models: \n{[json.dumps(TOOLS_DESCRIPTION[m], indent=2) for m in available_models]}\n"
-        f"Profile:\n{profile_json}\n"
+        f"User Profile:\n{profile_json}\n"
         f"Expected output format example:\n{example_output}\n\n"
         f"Please output the JSON file containing the usage of ALL availablemodels."
         "Your JSON response:"
@@ -403,36 +405,36 @@ def evaluate_recallers(
     
     # Compute the similarity between recallers for each user
     from tqdm import tqdm
-    for i in tqdm(range(len(uid)), desc='Computing similarity'):
-        # Compute the similarity between all recallers
-        for j, recaller1 in enumerate(recaller_names):
-            for k, recaller2 in enumerate(recaller_names):
-                if j < k:  # Avoid duplicate calculations
-                    list1 = all_recommendations[recaller1][i]
-                    list2 = all_recommendations[recaller2][i]
+    # for i in tqdm(range(len(uid)), desc='Computing similarity'):
+    #     # Compute the similarity between all recallers
+    #     for j, recaller1 in enumerate(recaller_names):
+    #         for k, recaller2 in enumerate(recaller_names):
+    #             if j < k:  # Avoid duplicate calculations
+    #                 list1 = all_recommendations[recaller1][i]
+    #                 list2 = all_recommendations[recaller2][i]
                     
-                    # Compute Jaccard similarity (for the entire list)
-                    jaccard = jaccard_similarity(list1, list2, k=10)
-                    similarity_metrics['jaccard'][f"{recaller1}_vs_{recaller2}"].append(jaccard)
+    #                 # Compute Jaccard similarity (for the entire list)
+    #                 jaccard = jaccard_similarity(list1, list2, k=10)
+    #                 similarity_metrics['jaccard'][f"{recaller1}_vs_{recaller2}"].append(jaccard)
                     
-                    # Compute RBO similarity
-                    rbo = rbo_similarity(list1, list2, p=0.9)
-                    similarity_metrics['rbo'][f"{recaller1}_vs_{recaller2}"].append(rbo)
-    result['similarities'] = {
-        'jaccard': {},
-        'rbo': {}
-    }
-    for sim_type in ['jaccard', 'rbo']:
-        for pair_name, values in similarity_metrics[sim_type].items():
-            avg_similarity = sum(values) / len(values) if values else 0.0
-            result['similarities'][sim_type][pair_name] = avg_similarity
+    #                 # Compute RBO similarity
+    #                 rbo = rbo_similarity(list1, list2, p=0.9)
+    #                 similarity_metrics['rbo'][f"{recaller1}_vs_{recaller2}"].append(rbo)
+    # result['similarities'] = {
+    #     'jaccard': {},
+    #     'rbo': {}
+    # }
+    # for sim_type in ['jaccard', 'rbo']:
+    #     for pair_name, values in similarity_metrics[sim_type].items():
+    #         avg_similarity = sum(values) / len(values) if values else 0.0
+    #         result['similarities'][sim_type][pair_name] = avg_similarity
         
-        # Compute the overall average similarity for all pairs
-        all_values = []
-        for values in similarity_metrics[sim_type].values():
-            all_values.extend(values)
-        if all_values:
-            result['similarities'][sim_type]['average'] = sum(all_values) / len(all_values)
-        else:
-            result['similarities'][sim_type]['average'] = 0.0        
+    #     # Compute the overall average similarity for all pairs
+    #     all_values = []
+    #     for values in similarity_metrics[sim_type].values():
+    #         all_values.extend(values)
+    #     if all_values:
+    #         result['similarities'][sim_type]['average'] = sum(all_values) / len(all_values)
+    #     else:
+    #         result['similarities'][sim_type]['average'] = 0.0        
     return result

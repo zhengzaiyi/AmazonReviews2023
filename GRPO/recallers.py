@@ -2,6 +2,7 @@ from typing import Dict, List, Optional, Union
 import os
 import torch
 import numpy as np
+from recbole.quick_start.quick_start import load_data_and_model
 
 from .data import InteractionData, get_base_config_dict
 
@@ -133,10 +134,35 @@ class RecBoleRecaller(BaseRecaller):
         elif self.model_name == 'LightGCN':
             model_config = {
                 **base_config,
-                'train_neg_sample_args': None,
+                'train_neg_sample_args': {
+                    'distribution': 'uniform',
+                    'sample_num': 1,
+                },
                 'loss_type': 'BPR',
                 'embedding_size': 64,
+                'n_layers': 3,
+                'reg_weight': 1e-5,
                 'learning_rate': 0.001,
+                'train_batch_size': 2048,
+                'eval_batch_size': 2048 * 20000,
+            }
+        elif self.model_name == 'SimpleX':
+            model_config = {
+                **base_config,
+                'train_neg_sample_args': {
+                    'distribution': 'uniform',
+                    'sample_num': 1,
+                },
+                'loss_type': 'BPR',
+                'embedding_size': 64,
+                'aggregator': 'mean',
+                'gamma': 0.5,
+                'margin': 0.9,
+                'negative_weight': 0.5,
+                'reg_weight': 1e-5,
+                'learning_rate': 0.001,
+                'train_batch_size': 2048,
+                'eval_batch_size': 2048 * 20000,
             }
         else:
             # Default configuration for other models
@@ -186,6 +212,7 @@ class RecBoleRecaller(BaseRecaller):
         self.model = self.model_class(self.config, self.dataset).to(self.config['device'])
 
         # Load checkpoint if provided
+        # TODO: 看看能不能用xxx加速
         if self.checkpoint_path and find_latest_checkpoint(self.model_name, self.checkpoint_path) and self.model_name not in ['Pop']:
             # Load checkpoint
             model_path = find_latest_checkpoint(self.model_name, self.checkpoint_path)

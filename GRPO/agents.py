@@ -93,6 +93,8 @@ class UserProfileAgent:
         return self.id2meta[str(item_id)]
 
     def forward(self, user_id: int, history: List[int]):
+        if 0 in history:
+            history = history[:history.index(0)]
         user_profile_dict = {}
         if user_id in self.user_feat.keys():
             user_profile_dict['Demographic'] = self.user_feat[user_id]

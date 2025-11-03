@@ -175,3 +175,4 @@ dataset/
 *.json
 */wandb/
 ref/
+completions

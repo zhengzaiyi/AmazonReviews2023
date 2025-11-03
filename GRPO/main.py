@@ -85,7 +85,7 @@ def initialize_recallers(
     failed_models = []
     
     # Supported models in RecBole
-    supported_models = ['BPR', 'SASRec', 'Pop', 'ItemKNN', 'FPMC', 'GRU4Rec']
+    supported_models = ['BPR', 'SASRec', 'Pop', 'ItemKNN', 'FPMC', 'GRU4Rec', 'LightGCN', 'SimpleX']
     
     for model_name in model_names:
         # Normalize model name
