@@ -176,3 +176,6 @@ dataset/
 */wandb/
 ref/
 completions
+soft_models/
+*.txt
+

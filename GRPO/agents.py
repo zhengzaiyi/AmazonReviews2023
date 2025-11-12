@@ -10,6 +10,8 @@ from collections import defaultdict
 from pydantic.config import ConfigDict
 import outlines
 from tqdm import tqdm
+import datetime
+import yaml
 
 
 import torch
@@ -92,9 +94,11 @@ class UserProfileAgent:
     def _get_item_metadata(self, item_id: int):
         return self.id2meta[str(item_id)]
 
-    def forward(self, user_id: int, history: List[int]):
+    def forward(self, user_id: int, history: List[int], cut_off: int = 5):
         if 0 in history:
             history = history[:history.index(0)]
+        if len(history) > cut_off:
+            history = history[-cut_off:]
         user_profile_dict = {}
         if user_id in self.user_feat.keys():
             user_profile_dict['Demographic'] = self.user_feat[user_id]
@@ -103,7 +107,10 @@ class UserProfileAgent:
             {**self.item_feat[item_id], **self.inter_feat.get(f'{user_id}_{item_id}', {})} 
             for item_id in history
         ]
-        return json.dumps(user_profile_dict, indent=4)
+        for hist_item in user_profile_dict['purchase history']:
+            if 'timestamp' in hist_item.keys():
+                hist_item['timestamp'] = datetime.datetime.fromtimestamp(hist_item['timestamp'] // 1000).strftime('%Y-%m-%d %H:%M:%S')
+        return yaml.dump(user_profile_dict, default_flow_style=False, allow_unicode=True)
 
 
 class LLMRouterAgent:
