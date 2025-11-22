@@ -33,26 +33,26 @@ cd /home/zzheng3/AmazonReviews2023
 #     --hf_model meta-llama/Llama-3.2-1B-Instruct
 
 PARALLEL_SIZE=1
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 # export CUDA_VISIBLE_DEVICES=4,5,6,7
-echo "================================================"
-echo "Running with SFT and RL"
-echo "================================================"
-accelerate launch --config_file GRPO/acc.yaml\
-    GRPO/main_trl.py \
-    --use_hf_local \
-    --dataset $1 \
-    --data_path dataset \
-    --parallel_size 2 \
-    --do_sft \
-    --do_rl \
-    --use_vllm \
-    --hf_model meta-llama/Llama-3.2-1B-Instruct
+# echo "================================================"
+# echo "Running with SFT and RL"
+# echo "================================================"
+# accelerate launch --config_file GRPO/acc.yaml\
+#     GRPO/main_trl.py \
+#     --use_hf_local \
+#     --dataset $1 \
+#     --data_path dataset \
+#     --parallel_size 2 \
+#     --do_sft \
+#     --do_rl \
+#     --use_vllm \
+#     --hf_model meta-llama/Llama-3.2-1B-Instruct
 
 echo "================================================"
 echo "Running ONLY with RL"
 echo "================================================"
-accelerate launch --config_file GRPO/acc.yaml\
+accelerate launch --config_file GRPO/acc.yaml \
     GRPO/main_trl.py \
     --use_hf_local \
     --dataset $1 \
@@ -60,4 +60,4 @@ accelerate launch --config_file GRPO/acc.yaml\
     --parallel_size 2 \
     --do_rl \
     --use_vllm \
-    --hf_model meta-llama/Llama-3.2-1B-Instruct \
+    --hf_model meta-llama/Llama-3.2-1B-Instruct

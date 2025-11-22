@@ -178,4 +178,5 @@ ref/
 completions
 soft_models/
 *.txt
+pure_models/
 

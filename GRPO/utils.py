@@ -80,44 +80,32 @@ def average_metrics(metrics_list: List[Dict[str, float]]) -> Dict[str, float]:
 
 TOOLS_DESCRIPTION = {
     "sasrec": {
-        "description": "A Transformer-based sequential recommendation model (Self-Attentive Sequential Recommendation). It captures the order and short-term interest patterns from the user's recent interactions.",
-        "when_to_use": "Use when the task requires modeling the sequence of recent user interactions or short-term preferences. For example, predicting the next item a user might click or watch.",
-        "input": "A chronologically ordered sequence of user-item interactions.",
-        "output": "Top-K candidate items predicted as the next likely interactions."
+        "description": "Transformer-based sequential model for short-term interest patterns",
+        "when_to_use": "Recent interaction sequences and short-term preferences",
     },
     "bpr": {
-        "description": "Bayesian Personalized Ranking, a classic pairwise ranking method based on matrix factorization. It focuses on modeling user preference orderings.",
-        "when_to_use": "Use when the task involves general recommendation based on long-term user preferences, without considering sequence order. Suitable for implicit feedback like clicks or likes.",
-        "input": "A user-item interaction matrix or embeddings representing user and item factors.",
-        "output": "Top-K candidate items ranked by the user's overall preference."
+        "description": "Matrix factorization for general user-item preference rankings", 
+        "when_to_use": "Long-term preferences without sequence order",
     },
     "lightgcn": {
-        "description": "A graph-based recommendation model using Graph Convolutional Networks. It propagates embeddings over a user-item bipartite graph to capture high-order connectivity.",
-        "when_to_use": "Use when the task involves graph structures, such as leveraging user-item relations or higher-order neighbor connections. Suitable for social or community-driven recommendations.",
-        "input": "A user-item bipartite graph.",
-        "output": "Top-K candidate items derived from graph-based user and item embeddings."
+        "description": "Graph neural network leveraging user-item connectivity",
+        "when_to_use": "Graph structures and higher-order neighbor relations",
     },
     "pop": {
-        "description": "A simple non-personalized baseline that recommends items purely based on their overall popularity (e.g., number of interactions).",
-        "when_to_use": "Use as a baseline for comparison or in cold-start situations where user-specific data is not available.",
-        "input": "Global item interaction counts or frequencies.",
-        "output": "Top-K items ranked by overall popularity."
+        "description": "Non-personalized popularity-based recommendations",
+        "when_to_use": "Baseline or cold-start situations",
     },
     "itemknn": {
-        "description": "An item-based collaborative filtering model that recommends items similar to those a user has already interacted with, using item-to-item similarity (e.g., cosine similarity, Jaccard).",
-        "when_to_use": "Use when item similarity can effectively capture user preference patterns. Works well in scenarios like e-commerce or content platforms where co-purchase or co-view signals are strong.",
-        "input": "Item-item similarity matrix built from historical user-item interactions.",
-        "output": "Top-K items most similar to the user’s past interacted items."
+        "description": "Item-based collaborative filtering using similarity",
+        "when_to_use": "Item similarity patterns and co-interaction signals",
     },
     "fpmc": {
-        "description": "Factorizing Personalized Markov Chains, a hybrid model combining matrix factorization (long-term user preferences) with first-order Markov chains (short-term sequential patterns). It predicts the next item by considering both user embedding and the transition from the last interacted item.",
-        "when_to_use": "Use when the recommendation task involves next-item prediction or session-based recommendation, where both long-term preferences and recent sequential behavior matter.",
-        "input": "User embedding (long-term preference) and the last interacted item (short-term context).",
-        "output": "Top-K candidate items predicted as the user's next likely interaction."
+        "description": "Hybrid model combining matrix factorization + Markov chains",
+        "when_to_use": "Next-item prediction with both long-term and sequential behavior",
     }
 }
 
-def build_prompt(profile_json: str, available_models: List[str] = None) -> str:
+def build_prompt(profile_json: str, available_models: List[str] = None, type: str = 'json') -> str:
     if available_models is None:
         available_models = ['sasrec', 'bpr', 'pop']
     models_str = "', '".join(available_models)
@@ -131,18 +119,25 @@ def build_prompt(profile_json: str, available_models: List[str] = None) -> str:
         } for model in available_models
     }
     example_output = json.dumps(example_output, indent=2)
-
-    return (
-        "You are a multi-channel recall assistant in a recommendation system. Given a user profile JSON, "
-        "output ONLY a JSON file describe the usage of different models during the multi-channel recall. Each element must be an object with keys: "
-        "\"name\" (string: model name like '"
-        + models_str + "'), \"k\" (integer between 1 and 500: number of items), \"weight\" (float between 0 and 1: model weight)\n\n"
-        f"Available models: \n{[json.dumps(TOOLS_DESCRIPTION[m], indent=2) for m in available_models]}\n"
-        f"User Profile:\n{profile_json}\n"
-        f"Expected output format example:\n{example_output}\n\n"
-        f"Please output the JSON file containing the usage of ALL availablemodels."
-        "Your JSON response:"
-    )
+    if type == 'json':
+        return (
+            "You are a multi-channel recall assistant in a recommendation system. Given a user profile, "
+            "output ONLY a JSON file describe the usage of different models during the multi-channel recall. Each element must be an object with keys: "
+            f"Available models: \n{[json.dumps(TOOLS_DESCRIPTION.get(m.lower(), {'description': f'Model {m}', 'when_to_use': 'General purpose'}), indent=2) for m in available_models]}\n"
+            f"User Profile:\n{profile_json}\n"
+            # f"Expected output format example:\n{example_output}\n\n"
+            f"Please output the JSON file containing the usage of ALL availablemodels."
+            "Your JSON response:"
+        )
+    elif type == 'classification':
+        return (
+            "You are an assistant in a recommendation system. Given a user profile, "
+            "output ONLY the best recaller model name from the available models."
+            # f"Available models: \n{[json.dumps(m, indent=2) for m in available_models]}\n"
+            f"User Profile:\n{profile_json}\n"
+            f"Available models: \n{[m for m in available_models]}\n"
+            "Your response:"
+        )
 
 
 def ndcg_rewards(
@@ -192,7 +187,7 @@ def multi_channel_recall(
     uid: List[int], 
     histories: List[List[int]], 
     recallers: Dict[str, RecBoleRecaller], 
-    final_k: int, 
+    total_item: int, 
 ) -> List[List[int]]:
     """Calculate multi-channel recall"""
     recall_results = []
@@ -203,21 +198,27 @@ def multi_channel_recall(
             else:
                 content = completion_msgs[-1]["content"]
             model_configs = json.loads(content)
+            
+            # Normalize model names to lowercase for consistency
+            normalized_configs = {}
+            for model_name, config in model_configs.items():
+                normalized_configs[model_name.lower()] = config
                 
             # Calculate recommendation results
             candidates = defaultdict(int)
             total_k = 0
-            assert set(model_configs.keys()) <= set(recallers.keys()), f"Model configs keys {model_configs.keys()} are not in recallers keys {recallers.keys()}"
-            for recaller in model_configs.keys():
-                total_k += model_configs[recaller]['top-k']
-            for recaller in model_configs.keys():
-                k = model_configs[recaller]['top-k'] * final_k * 1.5 / total_k # TODO: check magic number
-                w = model_configs[recaller]['score-weight']
+            assert set(normalized_configs.keys()) <= set(recallers.keys()), f"Model configs keys {normalized_configs.keys()} are not in recallers keys {recallers.keys()}"
+            for recaller in normalized_configs.keys():
+                total_k += normalized_configs[recaller]['top-k']
+            for recaller in normalized_configs.keys():
+                # k = normalized_configs[recaller]['top-k'] * total_item / total_k
+                k = total_item
+                w = normalized_configs[recaller]['score-weight']
                 
                 items = recallers[recaller].recall(uid[i], int(k), histories[i])
                 for item in items:
                     candidates[item[0]] += item[1] * w
-            candidates = sorted(candidates.keys(), key=lambda x: candidates[x], reverse=True)[:final_k]
+            candidates = sorted(candidates.keys(), key=lambda x: candidates[x], reverse=True)[:total_item]
             recall_results.append(candidates)
         except Exception as e:
             print(f"Error processing completion: {e}")
@@ -263,7 +264,7 @@ def evaluate(
         uid=uid, 
         histories=histories, 
         recallers=recallers, 
-        final_k=final_k
+        total_item=final_k
     )
     metrics = defaultdict(list)
     for i, recall_result in enumerate(recall_results):

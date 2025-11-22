@@ -1,7 +1,7 @@
 import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
-
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,7 +10,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.utils import ModelOutput
 
 
-def beta_nll_loss(alpha, beta, target):
+def beta_nll_loss(alpha, beta, target, apply_transform=True):
     """
     Compute negative log-likelihood for Beta distribution.
     
@@ -18,14 +18,16 @@ def beta_nll_loss(alpha, beta, target):
         alpha: Alpha parameter of Beta distribution (shape: [batch_size])
         beta: Beta parameter of Beta distribution (shape: [batch_size])
         target: Target values in [0, 1] (shape: [batch_size])
+        apply_transform: Whether to apply softplus+1.0 transform to alpha/beta
     
     Returns:
         Negative log-likelihood loss
     """
-    # Ensure parameters are positive and > 1 for well-defined Beta distribution
-    # Using softplus and adding 1.0 to ensure alpha, beta > 1
-    alpha = F.softplus(alpha) + 1.0
-    beta = F.softplus(beta) + 1.0
+    if apply_transform:
+        # Ensure parameters are positive and > 1 for well-defined Beta distribution
+        # Using softplus and adding 1.0 to ensure alpha, beta > 1
+        alpha = F.softplus(alpha) + 1.0
+        beta = F.softplus(beta) + 1.0
     
     # Ensure target is in valid range with epsilon for numerical stability
     # Using larger epsilon to avoid extreme values
@@ -38,6 +40,18 @@ def beta_nll_loss(alpha, beta, target):
     # -log p(y|α,β) = -[(α-1)log y + (β-1)log(1-y)] + log B(α,β)
     nll = -((alpha - 1) * torch.log(target) + (beta - 1) * torch.log(1 - target)) + log_beta_fn
     
+    return nll.mean()
+
+def logit_normal_nll(mu, sigma, target, eps=1e-4):
+    """
+    target: [0,1]，内部做轻微夹取到 (eps, 1-eps)
+    mu, sigma: 实数与正数，分别是 logit(y) 的均值/标准差
+    """
+    y = target.clamp(eps, 1 - eps)
+    z = torch.logit(y)                 # R
+    sigma = sigma.clamp_min(1e-6)
+    # 高斯 NLL：0.5 * [ ((z-mu)/sigma)^2 + 2*log(sigma) + log(2π) ]
+    nll = 0.5 * (((z - mu) / sigma) ** 2 + 2.0 * torch.log(sigma) + math.log(2 * math.pi))  # log(2π)=1.8378...
     return nll.mean()
 
 class LLMWithValueHead(PreTrainedModel):
@@ -263,11 +277,19 @@ class LLMWithValueHead(PreTrainedModel):
         
         value_loss = None
         if value_labels is not None:
-            alpha_preds = value_preds[:, 0]
-            beta_preds = value_preds[:, 1]
+            # alpha_preds = value_preds[:, 0]
+            # beta_preds = value_preds[:, 1]
+            # target = value_labels.index_select(0, rows).float()
+            # # Use Beta distribution negative log-likelihood loss
+            # value_loss = beta_nll_loss(alpha_preds, beta_preds, target)
+            raw_m, raw_s = value_preds[:, 0], value_preds[:, 1]
+            m = torch.sigmoid(raw_m)
+            s = F.softplus(raw_s) + 1e-2
+            alpha = m * s + 1
+            beta = (1 - m) * s + 1
             target = value_labels.index_select(0, rows).float()
-            # Use Beta distribution negative log-likelihood loss
-            value_loss = beta_nll_loss(alpha_preds, beta_preds, target)
+            # Alpha and beta are already positive from mean-concentration parameterization
+            value_loss = beta_nll_loss(alpha, beta, target, apply_transform=False)
         
         # Optionally, force next token at [num] to be [soft_token] by manipulating logits
         if soft_token_id is not None:
@@ -387,12 +409,20 @@ class LLMWithMixedTokenLoss(PreTrainedModel):
                 selected_hidden = last_hidden[batch_idx, prev_token_idx, :]
                 # value_head now outputs [batch_size, 2] for alpha and beta
                 value_preds = self.value_head(selected_hidden)
-                alpha_preds = value_preds[:, 0]
-                beta_preds = value_preds[:, 1]
+                mu, rho = value_preds[:, 0], value_preds[:, 1]
+                sigma = F.softplus(rho) + 1e-2
 
                 target = value_labels.to(value_preds.device)[batch_idx, token_idx].float()
                 # Use Beta distribution negative log-likelihood loss
-                value_loss = beta_nll_loss(alpha_preds, beta_preds, target)
+                # value_loss = logit_normal_nll(mu, sigma, target)
+                # value_loss = beta_nll_loss(alpha, beta, target, apply_transform=False)
+
+                with torch.no_grad():
+                    pos = (target > 0.5).float()
+                    n_pos = pos.sum().clamp(min=1.0)
+                    n_neg = (1 - pos).sum().clamp(min=1.0)
+                    pos_weight = n_neg / n_pos              # 稀有正样本 → 大权重
+                value_loss = torch.nn.functional.binary_cross_entropy_with_logits(mu, target, pos_weight=pos_weight)
             else:
                 value_preds = torch.empty(0, device=input_ids.device)
 
@@ -403,6 +433,8 @@ class LLMWithMixedTokenLoss(PreTrainedModel):
             total_loss = value_loss if total_loss is None else total_loss + value_loss
         if total_loss is None:
             total_loss = logits.sum() * 0.0
+
+        total_loss = value_loss
 
         if not return_dict:
             output = (logits, past_key_values, hidden_states_all, attentions)

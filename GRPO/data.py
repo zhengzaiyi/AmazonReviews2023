@@ -104,7 +104,7 @@ def load_dataset(dataset: str, data_path: str, seed: int = 42, filter_train: boo
         
         selected_positions = []
         for i, (start, count) in enumerate(zip(first_pos, counts)):
-            pos_in_user = min(int(count * 0.7), count - 1)
+            pos_in_user = min(int(count), count - 1)
             selected_positions.append(start + pos_in_user)
         
         keep_indices_sorted = order[selected_positions]     # 映射回原始样本下标

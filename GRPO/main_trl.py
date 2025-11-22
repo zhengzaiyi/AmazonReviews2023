@@ -41,7 +41,7 @@ def create_rl_dataset(
         if 0 in hist:
             hist = hist[:hist.index(0)]
         prof_json = '' if profile_agent is None else profile_agent.forward(uid, hist)
-        content = build_prompt(prof_json, recaller_names) if profile_agent is not None else recaller_names
+        content = build_prompt(prof_json, recaller_names) if profile_agent is not None else str(recaller_names)
         dataset.append({
             "prompt": [{"role": "user", "content": content}],
             "uid": uid,                           # User ID
@@ -150,7 +150,7 @@ def main():
     
     inter_dataset = load_dataset(args.dataset, args.data_path, seed=args.seed) 
     profile_agent = UserProfileAgent(inter_dataset, args.dataset)
-    cut_off_users = min(len(inter_dataset.train_user_ids), 1000)
+    cut_off_users = min(len(inter_dataset.train_user_ids), 100000)
     model_config = create_model_config(
         available_models=[model_name.lower() for model_name in args.recbole_models],
         default_configs=None,
@@ -275,7 +275,7 @@ def main():
                 uid=uid, 
                 histories=histories, 
                 recallers=recallers, 
-                final_k=args.final_k
+                total_item=args.final_k
             )
             for i, recall_result in enumerate(recall_results):
                 ndcg = ndcg_at_k(recall_result, target_items[i], k=args.final_k)
@@ -292,7 +292,7 @@ def main():
                 user_ids=inter_dataset.eval_user_ids,
                 histories=inter_dataset.eval_histories,
                 target_items=inter_dataset.eval_target_items,
-                recallers=recallers
+                recaller_names=[model_name.lower() for model_name in args.recbole_models]
             ) if args.do_eval else None,
             # peft_config=peft_config if args.use_peft else None,
         )

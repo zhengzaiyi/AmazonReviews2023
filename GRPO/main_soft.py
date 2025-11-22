@@ -27,6 +27,7 @@ from accelerate import Accelerator
 from collections import defaultdict
 from GRPO.soft_model import get_model_and_tokenizer, get_mixed_model_and_tokenizer
 from GRPO.soft_sft_trainer import SoftSFTTrainer
+from GRPO.soft_utils import build_soft_template, generate_soft_completions
 
 def create_sft_dataset(
     profile_agent: UserProfileAgent, 
@@ -68,13 +69,9 @@ def create_sft_dataset(
             
             import numpy as np
             scores = np.array(list(recaller_scores.values()))
-            weights = np.exp(scores * 2) / np.exp(scores * 2).sum()  # softmax with temperature=0.5
-            weights = weights * 0.9 + np.random.dirichlet(np.ones(len(weights))) * 0.1  # 10% noise
+            weights = np.exp(scores) / np.exp(scores).sum()  # softmax with temperature=0.5
 
-            total_k = int(final_k * 1.5)
-            k_values = np.maximum(5, (weights * total_k).astype(int))
-            k_values = (k_values * min(1, total_k / k_values.sum())).astype(int)
-            k_values = k_values / final_k
+            k_values = weights / weights.sum()
             
             # k_values is already normalized by final_k, so it should be in a reasonable range
             # We keep the normalized k_values (not converting back to int) for Beta distribution
@@ -107,11 +104,35 @@ def create_sft_dataset(
         })
     return Dataset.from_list(dataset)
 
+def create_rl_dataset(
+    profile_agent: UserProfileAgent, 
+    user_ids: List[int],
+    histories: List[List[int]],
+    target_items: List[int],
+    recaller_names: List[str]
+):
+    """Create TRL dataset containing information needed for reward calculation"""
+    dataset = []
+    for i, uid in enumerate(user_ids):
+        hist = histories[i]
+        if 0 in hist:
+            hist = hist[:hist.index(0)]
+        prof_json = '' if profile_agent is None else profile_agent.forward(uid, hist)
+        content = build_prompt(prof_json, recaller_names) if profile_agent is not None else recaller_names
+        dataset.append({
+            "prompt": content,
+            "uid": uid,
+            "histories": histories[i],
+            "target_items": [target_items[i]]
+        })
+    return Dataset.from_list(dataset)
+
 def get_soft_tokenizer(model_name: str):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     special_tokens = {"additional_special_tokens": ["[num]", "[soft_token]"]}
     num_added = tokenizer.add_special_tokens(special_tokens)
     return tokenizer
+
 
 
 class SoftDataCollator:
@@ -259,7 +280,11 @@ def parse_args():
     ap.add_argument('--output_dir', type=str, default='GRPO/soft_models')
     ap.add_argument('--gen_sft_data', action='store_true')
     ap.add_argument('--do_sft', action='store_true')
+    ap.add_argument('--do_rl', action='store_true', help='Run GRPO reinforcement learning')
     ap.add_argument('--do_test', action='store_true')
+    ap.add_argument('--do_test_sft', action='store_true')
+    ap.add_argument('--do_test_rl', action='store_true', help='Test RL model')
+    ap.add_argument('--do_test_sft_rl', action='store_true', help='Test SFT+RL model')
     ap.add_argument('--use_lora', action='store_true')
     ap.add_argument('--lora_r', type=int, default=16, help='LoRA rank')
     ap.add_argument('--lora_alpha', type=int, default=32, help='LoRA alpha')
@@ -277,6 +302,12 @@ def parse_args():
     ap.add_argument('--max_length', type=int, default=1536)
     ap.add_argument('--fp16', action='store_true')
     ap.add_argument('--gradient_checkpointing', action='store_true')
+    # GRPO specific arguments
+    ap.add_argument('--kl_coef', type=float, default=0.1, help='KL coefficient for GRPO')
+    ap.add_argument('--grpo_num_samples', type=int, default=10000, help='Number of samples for GRPO training')
+    ap.add_argument('--grpo_batch_size', type=int, default=2, help='Batch size for GRPO training')
+    ap.add_argument('--grpo_learning_rate', type=float, default=1e-5, help='Learning rate for GRPO')
+    ap.add_argument('--grpo_num_train_epochs', type=int, default=1, help='Number of epochs for GRPO')
     args = ap.parse_args()
     return args
 
@@ -290,9 +321,28 @@ def main():
     
     # Load dataset
     
+    model_save_dir_rl = f"{args.output_dir}/{args.dataset}/{args.model_name.split('/')[-1]}_rl"
+    grpo_config = GRPOConfig(
+            output_dir=model_save_dir_rl,
+            generation_batch_size=16,
+            learning_rate=args.grpo_learning_rate,
+            per_device_train_batch_size=args.grpo_batch_size,
+            per_device_eval_batch_size=args.grpo_batch_size,
+            num_train_epochs=args.grpo_num_train_epochs,
+            do_eval=False,
+            logging_steps=args.logging_steps,
+            save_strategy="epoch",
+            beta=0.0,  # In GRPOConfig, 'beta' is the KL penalty coefficient
+            max_prompt_length=2048,
+            max_completion_length=300,
+            seed=args.seed,
+            bf16=True,
+            report_to="none",
+            gradient_checkpointing=args.gradient_checkpointing
+        )
     
-    # Generate or load SFT data - only initialize recallers when generating data or testing
-    if args.gen_sft_data or args.do_test:
+    # Generate or load SFT data - only initialize recallers when generating data, testing, or RL training
+    if args.gen_sft_data or args.do_test_sft or args.do_test_rl or args.do_test_sft_rl or args.do_rl or args.do_test:
         inter_dataset = load_dataset(args.dataset, args.data_path, seed=args.seed)
         profile_agent = UserProfileAgent(inter_dataset, args.dataset)
         cut_off_users = min(len(inter_dataset.train_user_ids), args.num_train_samples)
@@ -308,7 +358,7 @@ def main():
     
     if args.gen_sft_data:
         # Generate SFT data separately to avoid GPU conflicts
-        assert not args.do_sft and not args.do_test
+        assert not args.do_sft and not args.do_test_sft and not args.do_rl and not args.do_test_rl and not args.do_test_sft_rl and not args.do_test
         
         # Get training data
         user_ids = inter_dataset.train_user_ids[:cut_off_users]
@@ -419,17 +469,126 @@ def main():
         model_name = get_last_checkpoint(model_save_dir)
         print(f"Using checkpoint: {model_name}")
     
-    if args.do_test:
-        # Test the model
+    if args.do_rl:
+        # GRPO training
         if args.do_sft:
-            model_save_dir = f"{args.output_dir}/{args.dataset}/{args.model_name.split('/')[-1]}_sft"
-            model_name = get_last_checkpoint(model_save_dir)
+            # Use SFT model as starting point
+            model_save_dir_base = f"{args.output_dir}/{args.dataset}/{args.model_name.split('/')[-1]}_sft"
+            model_name = get_last_checkpoint(model_save_dir_base)
         else:
+            model_name = args.model_name
+            
+        print(f"Starting GRPO training with model: {model_name}")
+        
+        # Create RL dataset
+        trl_train_dataset = create_rl_dataset(
+            profile_agent=profile_agent,
+            user_ids=inter_dataset.train_user_ids[:cut_off_users],
+            histories=inter_dataset.train_histories[:cut_off_users],
+            target_items=inter_dataset.train_target_items[:cut_off_users],
+            recaller_names=[m.lower() for m in args.recbole_models]
+        )
+        
+        # Load tokenizer
+        tokenizer = get_soft_tokenizer(model_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        # Define reward function for soft tokens
+        def soft_reward_func(completions, uid, histories, target_items, **kwargs):
+            """Calculate rewards for soft token predictions"""
+            rewards = []
+            recall_results = multi_channel_recall(
+                completions=completions, 
+                uid=uid, 
+                histories=histories, 
+                recallers=recallers, 
+                final_k=args.final_k
+            )
+            for i, recall_result in enumerate(recall_results):
+                ndcg = ndcg_at_k(recall_result, target_items[i], k=args.final_k)
+                rewards.append(ndcg)
+            return rewards
+        
+        # Create trainer
+        # Use mixed model with value head so that beta sampling can work
+        mixed_model, processing_tokenizer = get_mixed_model_and_tokenizer(model_name)
+        trainer = GRPOTrainer(
+            model=mixed_model,
+            reward_funcs=soft_reward_func,
+            args=grpo_config,
+            train_dataset=trl_train_dataset,
+            processing_class=processing_tokenizer,
+        )
+        # Enable beta-sampling generation path and pass model names to template
+        trainer.use_beta_sampling = True
+        trainer.beta_template_models = [m.lower() for m in args.recbole_models]
+        
+        # Train
+        print("Starting GRPO training...")
+        trainer.train()
+        
+        # Update model name for testing
+        model_name = get_last_checkpoint(model_save_dir_rl)
+        print(f"GRPO training completed. Model saved to: {model_name}")
+    
+    if args.do_test_sft or args.do_test_rl or args.do_test_sft_rl or args.do_test:
+        # Determine model path
+        if args.do_test_rl:
+            model_name = get_last_checkpoint(f"{args.output_dir}/{args.dataset}/{args.model_name.split('/')[-1]}_rl")
+        elif args.do_test_sft:
+            model_name = get_last_checkpoint(f"{args.output_dir}/{args.dataset}/{args.model_name.split('/')[-1]}_sft")
+        elif args.do_test_sft_rl:
+            model_name = get_last_checkpoint(f"{args.output_dir}/{args.dataset}/{args.model_name.split('/')[-1]}_sft_rl")
+        elif args.do_test:
             model_name = args.model_name
         
         print(f"Testing model: {model_name}")
-        # Load test data and evaluate
-        # TODO: Add evaluation logic here
+        
+        # Create test dataset
+        cut_off_test_users = min(len(inter_dataset.test_user_ids), 1000)
+        trl_test_dataset = create_rl_dataset(
+            profile_agent=profile_agent,
+            user_ids=inter_dataset.test_user_ids[:cut_off_test_users],
+            histories=inter_dataset.test_histories[:cut_off_test_users],
+            target_items=inter_dataset.test_target_items[:cut_off_test_users],
+            recaller_names=[m.lower() for m in args.recbole_models]
+        )
+        
+        # Load model and generate completions
+        model, tokenizer = get_mixed_model_and_tokenizer(model_name)
+        model.eval()
+        completions = generate_soft_completions(
+            model=model,
+            tokenizer=tokenizer,
+            test_dataset=trl_test_dataset,
+            model_names=[m.lower() for m in args.recbole_models],
+            max_length=args.max_length
+        )
+        
+        # Save and evaluate
+        os.makedirs("completions", exist_ok=True)
+        import pickle
+        completion_file = f"completions/soft_completions_{args.dataset}_{'rl' if args.do_test_rl else 'sft'}.pkl"
+        with open(completion_file, "wb") as f:
+            pickle.dump(completions, f)
+        print(f"Saved {len(completions)} completions to {completion_file}")
+        
+        # Evaluate
+        from GRPO.utils import evaluate
+        metrics = evaluate(
+            completions=completions,
+            uid=trl_test_dataset["uid"],
+            histories=trl_test_dataset["histories"],
+            recallers=recallers,
+            final_k=args.final_k,
+            target_items=trl_test_dataset["target_items"],
+            ks=[10, 50],
+        )
+        
+        print("Evaluation Results:")
+        for k, v in metrics.items():
+            print(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}")
 
 
 if __name__ == "__main__":

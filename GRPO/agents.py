@@ -167,7 +167,7 @@ class LLMRouterAgent:
             inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=100,
+                max_new_tokens=300,
                 min_new_tokens=10,
                 do_sample=True, 
                 temperature=temperature,

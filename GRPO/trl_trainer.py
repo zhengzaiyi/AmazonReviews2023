@@ -1064,6 +1064,11 @@ class GRPOTrainer(Trainer):
     def _generate_and_score_completions(
         self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
+        # Optional fast-path for beta sampling over soft tokens. When enabled, we build a lightweight
+        # placeholder completion with [num][soft_token], sample values from the model's value head (Beta),
+        # and return both a numeric completion for reward computation and value_labels/value_mask for loss.
+        if getattr(self, "use_beta_sampling", False):
+            return self._generate_and_score_completions_beta(inputs)
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 
@@ -1572,6 +1577,190 @@ class GRPOTrainer(Trainer):
             output["image_sizes"] = prompt_inputs["image_sizes"]
         return output
 
+    # --- SOFT TOKEN BETA-SAMPLING PATH ---
+    def _build_soft_template(self) -> str:
+        """Build a minimal JSON template containing [num][soft_token] placeholders."""
+        model_names = getattr(
+            self, "beta_template_models", ["bpr", "sasrec", "fpmc", "pop", "itemknn"]
+        )
+        lines = ["{"]
+        for i, name in enumerate(model_names):
+            lines.append(f'  "{name}": {{')
+            lines.append('    "top-k": [num][soft_token],')
+            lines.append('    "score-weight": [num][soft_token]')
+            lines.append("  }" + ("," if i < len(model_names) - 1 else ""))
+        lines.append("}")
+        return "\n".join(lines)
+
+    def _generate_and_score_completions_beta(
+        self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
+    ) -> dict[str, Union[torch.Tensor, Any]]:
+        """Generate completions by sampling values from Beta distributions predicted at [num] positions.
+        - completion text (for reward) uses numeric values
+        - model inputs use placeholders so we can train with value_labels/value_mask
+        """
+        device = self.accelerator.device
+        mode = "train" if self.model.training else "eval"
+
+        prompts = [x["prompt"] for x in inputs]
+        original_prompts = copy.deepcopy(prompts)
+
+        # Encode prompts (left padding, no special tokens) to compute lengths
+        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
+        prompt_inputs = self.processing_class(
+            text=prompts_text,
+            return_tensors="pt",
+            padding=True,
+            padding_side="left",
+            add_special_tokens=False,
+        )
+        prompt_inputs = super()._prepare_inputs(prompt_inputs)
+        prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
+
+        # Build a placeholder template once and append to each prompt
+        soft_template = self._build_soft_template()
+        full_texts = [p + "\n\n" + soft_template for p in prompts_text]
+        full_inputs = self.processing_class(
+            text=full_texts,
+            return_tensors="pt",
+            padding=True,
+            padding_side="left",
+            add_special_tokens=False,
+        )
+        full_inputs = super()._prepare_inputs(full_inputs)
+        full_ids, full_mask = full_inputs["input_ids"], full_inputs["attention_mask"]
+
+        # Derive completion ids by slicing off prompt length per row
+        prompt_lengths = prompt_mask.sum(dim=1).tolist()
+        completion_ids_list = []
+        for i, plen in enumerate(prompt_lengths):
+            row = full_ids[i]
+            completion_ids_list.append(row[plen:].tolist())
+
+        # Pad completion ids tensor
+        completion_ids = [torch.tensor(x, device=device, dtype=torch.long) for x in completion_ids_list]
+        completion_ids = pad(completion_ids, padding_value=self.pad_token_id)
+
+        # Build completion mask (up to EOS if present)
+        is_eos = completion_ids == self.eos_token_id
+        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
+        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+        sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
+        completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+
+        # Prepare ids/masks for value prediction forward
+        num_token_id = self.processing_class.convert_tokens_to_ids("[num]")
+        soft_token_id = self.processing_class.convert_tokens_to_ids("[soft_token]")
+
+        # Single pass to get hidden states at [num] positions, then Beta params from model.value_head
+        with torch.no_grad():
+            # Use the current model, request hidden states
+            outputs = self.model(
+                input_ids=full_ids.to(device),
+                attention_mask=full_mask.to(device),
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            if not hasattr(outputs, "hidden_states") or outputs.hidden_states is None:
+                # Fallback: no hidden states available
+                last_hidden = None
+            else:
+                last_hidden = outputs.hidden_states[-1]
+
+        # Build value_labels/value_mask aligned with completion_ids
+        value_labels = torch.zeros_like(completion_ids, dtype=torch.float32)
+        value_mask = torch.zeros_like(completion_ids, dtype=torch.bool)
+
+        sampled_values_for_reward = []
+        alpha_params_all = []
+        beta_params_all = []
+
+        if last_hidden is not None and hasattr(self.model, "value_head"):
+            # For each row, find [num] positions in the full_ids, but write targets at [soft_token] positions within completion_ids
+            for i in range(full_ids.size(0)):
+                # Slice out completion part for soft_token detection
+                comp_slice = completion_ids[i]
+                soft_pos = (comp_slice == soft_token_id).nonzero(as_tuple=True)[0]
+
+                # Find [num] positions in full sequence
+                num_pos_full = (full_ids[i] == num_token_id).nonzero(as_tuple=True)[0]
+                if soft_pos.numel() == 0 or num_pos_full.numel() == 0:
+                    sampled_values_for_reward.append([])
+                    continue
+
+                # Predict Beta params at hidden states gathered at [num] positions
+                hidden_at_nums = last_hidden[i, num_pos_full, :]  # (K, H)
+                beta_params = self.model.value_head(hidden_at_nums)  # (K, 2)
+                alpha = torch.nn.functional.softplus(beta_params[:, 0]) + 1.0
+                beta = torch.nn.functional.softplus(beta_params[:, 1]) + 1.0
+
+                # Sample K values, then map to first K [soft_token] positions in completion
+                sampled_vals = []
+                for a, b in zip(alpha, beta):
+                    dist = torch.distributions.Beta(a, b)
+                    val = dist.sample().clamp(0.0 + 1e-6, 1.0 - 1e-6)
+                    sampled_vals.append(val.item())
+                k = min(len(sampled_vals), soft_pos.numel())
+                if k > 0:
+                    value_labels[i, soft_pos[:k]] = torch.tensor(sampled_vals[:k], dtype=torch.float32, device=device)
+                    value_mask[i, soft_pos[:k]] = True
+                sampled_values_for_reward.append(sampled_vals[:k])
+                alpha_params_all.append(alpha)
+                beta_params_all.append(beta)
+        else:
+            # No value head; return empty labels
+            for _ in range(full_ids.size(0)):
+                sampled_values_for_reward.append([])
+
+        # Decode numeric completions for reward: replace each [num][soft_token] with sampled numeric
+        template = self._build_soft_template()
+        completions_text = []
+        for vals in sampled_values_for_reward:
+            txt = template
+            for v in vals:
+                txt = txt.replace("[num][soft_token]", f"{float(v):.6f}", 1)
+            # If some placeholders remain (e.g., not enough samples), fill with 0.0
+            while "[num][soft_token]" in txt:
+                txt = txt.replace("[num][soft_token]", "0.000000", 1)
+            completions_text.append(txt)
+
+        # Build prompt_completion_ids for potential IS/ KL (reuse full)
+        prompt_completion_ids = torch.cat([prompt_ids.to(device), completion_ids], dim=1)
+
+        # Rewards → advantages (same as default path)
+        rewards_per_func = self._calculate_rewards(inputs, original_prompts, completions_text, completion_ids_list)
+        rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
+        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        advantages = rewards - mean_grouped_rewards
+        if self.scale_rewards in ["group", "none"]:
+            std_rewards = rewards.view(-1, self.num_generations).std(dim=1)
+            std_rewards = std_rewards.repeat_interleave(self.num_generations, dim=0)
+        elif self.scale_rewards == "batch":
+            std_rewards = rewards.std().expand_as(rewards)
+        else:
+            raise ValueError(f"Invalid value for scale_rewards: {self.scale_rewards}.")
+        if self.scale_rewards != "none":
+            advantages = advantages / (std_rewards + 1e-4)
+
+        # Aggregate lengths for DAPO
+        completion_lengths = completion_mask.sum(1)
+        agg_completion_lengths = self.accelerator.gather(completion_lengths)
+        num_items_in_batch = agg_completion_lengths.sum()
+
+        # Prepare output dict with additional value fields.
+        output = {
+            "prompt_ids": prompt_ids.to(device),
+            "prompt_mask": prompt_mask.to(device),
+            "completion_ids": completion_ids,
+            "completion_mask": completion_mask,
+            "advantages": advantages,
+            "num_items_in_batch": num_items_in_batch,
+            "value_labels": value_labels,
+            "value_mask": value_mask,
+        }
+        return output
+
     def compute_liger_loss(self, unwrapped_model, inputs):
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
@@ -1632,6 +1821,8 @@ class GRPOTrainer(Trainer):
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+        # By default, use all completion tokens for policy loss
+        policy_mask = completion_mask.clone()
 
         # Compute the per_token_logps and the entropy at each position in the completion
         per_token_logps, entropies = self._get_per_token_logps_and_entropies(
@@ -1645,6 +1836,34 @@ class GRPOTrainer(Trainer):
             pixel_attention_mask=inputs.get("pixel_attention_mask"),
             image_sizes=inputs.get("image_sizes"),
         )
+
+        # Optional: compute value loss for soft tokens using value_labels/value_mask (if present)
+        value_loss = None
+        if "value_labels" in inputs and "value_mask" in inputs:
+            # Mask out soft-token positions from policy loss
+            try:
+                non_value_mask = (~inputs["value_mask"].bool()).int()
+                policy_mask = (policy_mask * non_value_mask).int()
+            except Exception:
+                pass
+            # Build full-length value labels/mask (prepend prompt-length zeros/Falses)
+            bsz, p_len = prompt_ids.size(0), prompt_ids.size(1)
+            c_len = completion_ids.size(1)
+            full_value_labels = torch.zeros((bsz, p_len + c_len), dtype=torch.float32, device=input_ids.device)
+            full_value_labels[:, p_len:] = inputs["value_labels"].to(full_value_labels.dtype)
+            full_value_mask = torch.zeros((bsz, p_len + c_len), dtype=torch.bool, device=input_ids.device)
+            full_value_mask[:, p_len:] = inputs["value_mask"].to(torch.bool)
+            # Compute value loss via model forward
+            outputs_for_value = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=input_ids,  # keep LM loss available if needed by the model
+                value_labels=full_value_labels,
+                value_mask=full_value_mask,
+                return_dict=True,
+            )
+            if hasattr(outputs_for_value, "value_loss") and outputs_for_value.value_loss is not None:
+                value_loss = outputs_for_value.value_loss
 
         if self.top_entropy_quantile < 1.0:
             entropy_mask = self.get_high_entropy_mask(entropies, completion_mask, 1 - self.top_entropy_quantile)
@@ -1702,30 +1921,34 @@ class GRPOTrainer(Trainer):
             per_token_loss = per_token_loss + self.beta * per_token_kl
 
         if self.loss_type == "grpo":
-            loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
+            loss = ((per_token_loss * policy_mask).sum(-1) / policy_mask.sum(-1).clamp(min=1.0)).mean()
             loss = loss / self.current_gradient_accumulation_steps
         elif self.loss_type == "bnpo":
-            loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+            loss = (per_token_loss * policy_mask).sum() / policy_mask.sum().clamp(min=1.0)
             loss = loss / self.current_gradient_accumulation_steps
         elif self.loss_type == "dr_grpo":
-            loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
+            loss = (per_token_loss * policy_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
             loss = loss / self.current_gradient_accumulation_steps
         elif self.loss_type == "dapo":
             normalizer = inputs["num_items_in_batch"] / self.accelerator.num_processes
-            loss = (per_token_loss * completion_mask).sum() / normalizer
+            loss = (per_token_loss * policy_mask).sum() / normalizer
         else:
             raise ValueError(f"Unknown loss type: {self.loss_type}")
+
+        # Add value loss if available
+        if value_loss is not None:
+            loss = loss + value_loss
 
         # Log the metrics
         mode = "train" if self.model.training else "eval"
 
-        completion_token_count = completion_mask.sum().clamp(min=1.0)
+        completion_token_count = policy_mask.sum().clamp(min=1.0)
 
         def masked_batch_mean(x):
             if x.shape[1] == 1:  # when importance_sampling_level == "sequence"
                 return x.mean()
             else:
-                return (x * completion_mask).sum() / completion_token_count
+                return (x * policy_mask).sum() / completion_token_count
 
         if self.beta != 0.0:
             mean_kl = masked_batch_mean(per_token_kl)
