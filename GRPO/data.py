@@ -48,7 +48,7 @@ def get_base_config_dict(dataset_name: str, data_path: str = 'dataset', seed: in
             'rating': '[3,inf)'
         },
         'eval_args': {
-            'split': {'LS': 'valid_and_test'},  # Leave-One-Out
+            'split': {'RS': [0.8, 0.1, 0.1]},  # Leave-One-Out
             'order': 'TO',
             'group_by': 'user'
         },
@@ -66,7 +66,7 @@ def get_base_config_dict(dataset_name: str, data_path: str = 'dataset', seed: in
         del config_dict['val_interval']
     return config_dict
 
-def load_dataset(dataset: str, data_path: str, seed: int = 42, filter_train: bool = True) -> InteractionData:
+def load_dataset(dataset: str, data_path: str, seed: int = 42, filter_train: bool = False) -> InteractionData:
     config_dict = get_base_config_dict(dataset, data_path, seed)
     cfg = Config(
         model="SASRec", 

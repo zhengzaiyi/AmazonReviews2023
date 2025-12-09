@@ -48,6 +48,21 @@ class UserProfileAgent:
         item_feat_pd.columns = item_feat_pd.columns.str.split(':').str[0]
         for row in tqdm(item_feat_pd.iterrows(), desc='Preprocessing item_feat'):
             row_dict = row[1].to_dict()
+            # Clean string values that might have Python unicode prefix or escape sequences
+            for k, v in row_dict.items():
+                if isinstance(v, str):
+                    # Remove Python 2 unicode prefix (u"..." or u'...')
+                    if (v.startswith("u'") and v.endswith("'")) or (v.startswith('u"') and v.endswith('"')):
+                        v = v[2:-1]
+                    # Decode unicode escape sequences like \u2122 -> ™
+                    try:
+                        v = v.encode('utf-8').decode('unicode_escape').encode('latin1').decode('utf-8')
+                    except (UnicodeDecodeError, UnicodeEncodeError):
+                        try:
+                            v = v.encode('utf-8').decode('unicode_escape')
+                        except:
+                            pass  # Keep original if decoding fails
+                    row_dict[k] = v
             itoken = row_dict.pop(self.iid_field)
             if str(itoken) in inter_dataset.ds.field2token_id[self.iid_field].keys():
                 self.item_feat[inter_dataset.ds.field2token_id[self.iid_field][str(itoken)]] = self._preprocess_feat(row_dict, inter_dataset.ds)
@@ -66,6 +81,25 @@ class UserProfileAgent:
             if type(var) == float:
                 return int(var)
             return var
+        
+        def clean_value(val):
+            """Clean problematic values for natural language prompts"""
+            if val is None:
+                return None
+            # Handle [PAD] tokens
+            if isinstance(val, str) and val == '[PAD]':
+                return None  # Will be filtered out
+            # Handle NaN values
+            if isinstance(val, float) and (np.isnan(val) or val != val):
+                return None
+            # Handle string 'nan' or '.nan'
+            if isinstance(val, str) and val.lower() in ['nan', '.nan']:
+                return None
+            # Clean Python unicode prefix (u"..." or u'...')
+            if isinstance(val, str) and (val.startswith("u'") or val.startswith('u"')):
+                val = val[2:-1] if val.endswith(val[1]) else val[1:]
+            return val
+        
         for key in feat.keys():
             if key not in field2id_token.keys():
                 res[key] = feat[key]
@@ -75,6 +109,11 @@ class UserProfileAgent:
                 res[key] = field2id_token[key][change_type(feat[key])]
             if key in dataset_feat_alias[self.dataset_name].keys():
                 res[key] = dataset_feat_alias[self.dataset_name][key][change_type(res[key])]
+            # Clean the value
+            res[key] = clean_value(res[key])
+        
+        # Remove keys with None values (filtered out [PAD], NaN, etc.)
+        res = {k: v for k, v in res.items() if v is not None}
         return res
 
 
@@ -94,7 +133,7 @@ class UserProfileAgent:
     def _get_item_metadata(self, item_id: int):
         return self.id2meta[str(item_id)]
 
-    def forward(self, user_id: int, history: List[int], cut_off: int = 5):
+    def forward(self, user_id: int, history: List[int], cut_off: int = 5, use_meta_data: bool = False):
         if 0 in history:
             history = history[:history.index(0)]
         if len(history) > cut_off:
@@ -104,13 +143,28 @@ class UserProfileAgent:
             user_profile_dict['Demographic'] = self.user_feat[user_id]
         user_profile_dict['purchased item numbers'] = len(history)
         user_profile_dict['purchase history'] = [
-            {**self.item_feat[item_id], **self.inter_feat.get(f'{user_id}_{item_id}', {})} 
+            {**self.item_feat.get(item_id, {}), **self.inter_feat.get(f'{user_id}_{item_id}', {})} 
             for item_id in history
         ]
+               
         for hist_item in user_profile_dict['purchase history']:
             if 'timestamp' in hist_item.keys():
-                hist_item['timestamp'] = datetime.datetime.fromtimestamp(hist_item['timestamp'] // 1000).strftime('%Y-%m-%d %H:%M:%S')
-        return yaml.dump(user_profile_dict, default_flow_style=False, allow_unicode=True)
+                ts = hist_item['timestamp']
+                # Handle various timestamp formats
+                try:
+                    if ts > 1e12:  # Milliseconds (e.g., 1609459200000)
+                        ts = ts / 1000
+                    if ts > 1e9:  # Reasonable Unix timestamp (after 2001)
+                        hist_item['timestamp'] = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+                    else:
+                        # Invalid timestamp (e.g., 0 -> 1970), mark as unknown
+                        hist_item['timestamp'] = 'unknown'
+                except (ValueError, OSError, OverflowError):
+                    # Invalid timestamp, mark as unknown
+                    hist_item['timestamp'] = 'unknown'
+        
+        # Use yaml.dump with safe_dump behavior and proper unicode handling
+        return yaml.dump(user_profile_dict, default_flow_style=False, allow_unicode=True, default_style=None)
 
 
 class LLMRouterAgent:

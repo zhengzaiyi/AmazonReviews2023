@@ -114,7 +114,6 @@ def build_prompt(profile_json: str, available_models: List[str] = None, type: st
     import random
     example_output = {
         model: {
-            "top-k": f'integer between 1 and 500',
             "score-weight": f'float between 0 and 1'
         } for model in available_models
     }
@@ -122,18 +121,18 @@ def build_prompt(profile_json: str, available_models: List[str] = None, type: st
     if type == 'json':
         return (
             "You are a multi-channel recall assistant in a recommendation system. Given a user profile, "
-            "output ONLY a JSON file describe the usage of different models during the multi-channel recall. Each element must be an object with keys: "
-            f"Available models: \n{[json.dumps(TOOLS_DESCRIPTION.get(m.lower(), {'description': f'Model {m}', 'when_to_use': 'General purpose'}), indent=2) for m in available_models]}\n"
+            "output ONLY a JSON file describe the score-weights of different models during the multi-channel recall."
+            f"Available models: \n{[json.dumps(TOOLS_DESCRIPTION[m.lower()], indent=2) for m in available_models]}\n"
             f"User Profile:\n{profile_json}\n"
             # f"Expected output format example:\n{example_output}\n\n"
-            f"Please output the JSON file containing the usage of ALL availablemodels."
+            f"Please output the JSON file containing the score-weights of ALL available models."
             "Your JSON response:"
         )
     elif type == 'classification':
         return (
             "You are an assistant in a recommendation system. Given a user profile, "
             "output ONLY the best recaller model name from the available models."
-            # f"Available models: \n{[json.dumps(m, indent=2) for m in available_models]}\n"
+            f"Available models: \n{[json.dumps(m, indent=2) for m in available_models]}\n"
             f"User Profile:\n{profile_json}\n"
             f"Available models: \n{[m for m in available_models]}\n"
             "Your response:"
@@ -149,7 +148,7 @@ def ndcg_rewards(
     final_k: int, 
     **kwargs
 ):
-    """Abandoned"""
+    """Abandoned - Calculate NDCG rewards using only score-weights"""
     rewards = []
     
     for i, completion_msgs in enumerate(completions):
@@ -159,16 +158,13 @@ def ndcg_rewards(
             model_configs = json.loads(content)
             
             # Calculate recommendation results
-            candidates = defaultdict(int)
-            total_k = 0
+            candidates = defaultdict(float)
             for recaller in recallers.keys():
-                total_k += model_configs[recaller]['top-k']
-            for recaller in recallers.keys():
-                k = model_configs[recaller]['top-k'] * final_k * 1.5 / total_k # TODO: check magic number
                 w = model_configs[recaller]['score-weight']
                 
                 if recaller in recallers:
-                    items = recallers[recaller].recall(uid[i], int(k), histories[i])
+                    # Get full item list
+                    items = recallers[recaller].recall(uid[i], final_k, histories[i])
                     for item in items:
                         candidates[item[0]] += item[1] * w
             
@@ -189,7 +185,7 @@ def multi_channel_recall(
     recallers: Dict[str, RecBoleRecaller], 
     total_item: int, 
 ) -> List[List[int]]:
-    """Calculate multi-channel recall"""
+    """Calculate multi-channel recall using only score-weights"""
     recall_results = []
     for i, completion_msgs in enumerate(completions):
         try:
@@ -205,19 +201,18 @@ def multi_channel_recall(
                 normalized_configs[model_name.lower()] = config
                 
             # Calculate recommendation results
-            candidates = defaultdict(int)
-            total_k = 0
+            candidates = defaultdict(float)
             assert set(normalized_configs.keys()) <= set(recallers.keys()), f"Model configs keys {normalized_configs.keys()} are not in recallers keys {recallers.keys()}"
+            
             for recaller in normalized_configs.keys():
-                total_k += normalized_configs[recaller]['top-k']
-            for recaller in normalized_configs.keys():
-                # k = normalized_configs[recaller]['top-k'] * total_item / total_k
-                k = total_item
                 w = normalized_configs[recaller]['score-weight']
                 
-                items = recallers[recaller].recall(uid[i], int(k), histories[i])
+                # Get full item list from recaller
+                items = recallers[recaller].recall(uid[i], total_item, histories[i])
                 for item in items:
                     candidates[item[0]] += item[1] * w
+            
+            # Sort by weighted scores and return top items
             candidates = sorted(candidates.keys(), key=lambda x: candidates[x], reverse=True)[:total_item]
             recall_results.append(candidates)
         except Exception as e:

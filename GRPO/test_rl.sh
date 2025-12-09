@@ -4,12 +4,20 @@ export TORCH_COMPILE_DISABLE=1
 export TORCHDYNAMO_DISABLE=1
 
 # 运行测试命令
-cd /home/zzheng3/AmazonReviews2023
-python GRPO/main_trl.py \
-    --use_hf_local \
+
+echo "================================================" 
+echo "Testing pure GRPO model..."
+echo "================================================"
+python GRPO/main_pure.py \
     --dataset $1 \
     --data_path dataset \
-    --recbole_models BPR ItemKNN FPMC Pop SASRec\
-    --do_test \
-    --do_test_rl \
-    --use_vllm
+    --checkpoint_dir ./checkpoints \
+    --output_dir GRPO/pure_models \
+    --model_name meta-llama/Llama-3.2-1B-Instruct \
+    --recbole_models BPR SASRec LightGCN \
+    --do_test_grpo \
+    --final_k 50 \
+    --seed 42 \
+    --bf16 \
+    --padding_side left \
+    --profile_cutoff 20

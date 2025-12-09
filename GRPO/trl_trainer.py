@@ -25,6 +25,7 @@ from typing import Any, Callable, Optional, Union
 
 import datasets
 import torch
+import torch.nn.functional as F
 import torch.utils.data
 import transformers
 from accelerate import logging
@@ -76,7 +77,8 @@ from trl.trainer.utils import (
     truncate_with_protected_tokens,
     unsplit_pixel_values_by_grid,
 )
-
+from GRPO.soft_utils import multi_channel_recall_softmax, compute_ndcg_at_k, gumbel_softmax_sample
+from GRPO.utils import recall_at_k
 
 if is_peft_available():
     from peft import PeftConfig, PeftModel
@@ -279,6 +281,10 @@ class GRPOTrainer(Trainer):
         self.pad_token = tokenizer.pad_token
         self.pad_token_id = tokenizer.pad_token_id
         self.eos_token_id = tokenizer.eos_token_id
+        
+        # Ensure model config has pad_token_id set for batch processing
+        if model.config.pad_token_id is None:
+            model.config.pad_token_id = self.pad_token_id
         self.image_token = getattr(processing_class, "image_token", None)
         self.image_token_id = getattr(processing_class, "image_token_id", None)
         self.vision_start_token_id = getattr(model.config, "vision_start_token_id", None)
@@ -430,6 +436,8 @@ class GRPOTrainer(Trainer):
             config = AutoConfig.from_pretrained(model_id)
             architecture = getattr(transformers, config.architectures[0])
             self.ref_model = architecture.from_pretrained(model_id, **model_init_kwargs)
+            # Set padding token for ref_model to handle batch sizes > 1
+            self.ref_model.config.pad_token_id = self.pad_token_id
 
         # Disable dropout in the models
         if args.disable_dropout:
@@ -1069,6 +1077,10 @@ class GRPOTrainer(Trainer):
         # and return both a numeric completion for reward computation and value_labels/value_mask for loss.
         if getattr(self, "use_beta_sampling", False):
             return self._generate_and_score_completions_beta(inputs)
+        # Optional path for pure classification models (e.g., from main_pure.py)
+        # Uses softmax output as weights for multi-channel recall
+        if getattr(self, "use_pure_classification", False):
+            return self._generate_and_score_completions_classification(inputs)
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 
@@ -1577,6 +1589,195 @@ class GRPOTrainer(Trainer):
             output["image_sizes"] = prompt_inputs["image_sizes"]
         return output
 
+    # --- PURE CLASSIFICATION GRPO PATH ---
+    def _generate_and_score_completions_classification(
+        self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
+    ) -> dict[str, Union[torch.Tensor, Any]]:
+        """
+        Generate and score completions for classification models (Pure GRPO).
+        
+        Uses softmax output from classification model as weights for multi-channel recall.
+        Similar to main_soft.py's beta_sampling but for classification models.
+        """
+        
+        device = self.accelerator.device
+        mode = "train" if self.model.training else "eval"
+        
+        prompts = [x["prompt"] for x in inputs]
+        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
+        
+        # Tokenize prompts
+        prompt_inputs = self.processing_class(
+            text=prompts_text,
+            return_tensors="pt",
+            padding=True,
+            padding_side="left",
+            add_special_tokens=False,
+        )
+        prompt_inputs = super()._prepare_inputs(prompt_inputs)
+        prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
+        
+        # Get classification logits from model
+        # Note: We keep model in training mode to allow dropout to provide randomness
+        # even though we use torch.no_grad() for efficiency
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=prompt_ids.to(device),
+                attention_mask=prompt_mask.to(device),
+            )
+            old_logits = outputs.logits  # (batch_size, num_classes)
+        
+        # Get recaller names and recallers from trainer attributes
+        recaller_names = getattr(self, "pure_recaller_names", [])
+        recallers = getattr(self, "pure_recallers", {})
+        final_k = getattr(self, "pure_final_k", 50)
+        
+        # Get Gumbel-Softmax parameters from trainer attributes (set once, used throughout)
+        # These are stored as class attributes when use_pure_classification is enabled
+        if not hasattr(self, 'pure_tau_gumbel'):
+            self.pure_tau_gumbel = getattr(self.args, 'tau_gumbel', getattr(self, 'temperature', 1.0))
+        if not hasattr(self, 'pure_top_p'):
+            self.pure_top_p = getattr(self.args, 'top_p', self.top_p if hasattr(self, 'top_p') else 0.9)
+        if not hasattr(self, 'pure_noise_scale'):
+            self.pure_noise_scale = getattr(self, 'noise_scale', 0.3)  # Default to smaller noise
+        if not hasattr(self, 'use_soft_grpo_loss'):
+            # SofT-GRPO loss (Gumbel reparameterization) is default; set to False for PPO-style loss
+            self.use_soft_grpo_loss = getattr(self.args, 'use_soft_grpo_loss', True)
+        tau_gumbel = self.pure_tau_gumbel
+        top_p = self.pure_top_p
+        noise_scale = self.pure_noise_scale
+        
+        # Compute softmax weights with Gumbel-Softmax sampling for randomness
+        # This ensures each generation produces different weights even for the same prompt
+        # noise_scale controls exploration: 0.0 = deterministic, 1.0 = full Gumbel noise
+        softmax_weights_list = []
+        gumbel_caches = []  # Store caches for importance ratio computation
+        for logit in old_logits:
+            y_soft, cache = gumbel_softmax_sample(
+                logit, 
+                tau=tau_gumbel, 
+                top_p=top_p,
+                noise_scale=noise_scale
+            )
+            softmax_weights_list.append(y_soft)
+            gumbel_caches.append(cache)
+        softmax_weights = torch.stack(softmax_weights_list)
+        
+        # Pre-cache recaller outputs for each unique (user_id, history) to avoid redundant calls
+        # This is crucial for performance since num_generations samples share the same user/history
+        recaller_cache = {}  # (user_id, tuple(history)) -> {recaller_name: [(item_id, score), ...]}
+        for inp in inputs:
+            user_id = inp.get('user_id', 0)
+            history = inp.get('history', [])
+            cache_key = (user_id, tuple(history) if history else ())
+            
+            if cache_key not in recaller_cache and history and recallers:
+                recaller_cache[cache_key] = {}
+                for name in recaller_names:
+                    name_lower = name.lower()
+                    if name_lower in recallers:
+                        items = recallers[name_lower].recall(user_id, final_k, history)
+                        recaller_cache[cache_key][name_lower] = items
+        
+        # Compute rewards using cached recaller outputs
+        rewards = []
+        metrics_ndcg10, metrics_ndcg50 = [], []
+        metrics_recall10, metrics_recall50 = [], []
+        for i, weights in enumerate(softmax_weights):
+            try:
+                user_id = inputs[i].get('user_id', i)
+                history = inputs[i].get('history', [])
+                ground_truth = inputs[i].get('target_items', [])
+                cache_key = (user_id, tuple(history) if history else ())
+                
+                if not recallers or not history or cache_key not in recaller_cache:
+                    rewards.append(0.0)
+                    metrics_ndcg10.append(0.0)
+                    metrics_ndcg50.append(0.0)
+                    metrics_recall10.append(0.0)
+                    metrics_recall50.append(0.0)
+                    continue
+                
+                # Use cached recaller outputs with current weights
+                candidates = defaultdict(float)
+                cached_outputs = recaller_cache[cache_key]
+                for j, name in enumerate(recaller_names):
+                    weight = weights[j].item() if torch.is_tensor(weights[j]) else weights[j]
+                    name_lower = name.lower()
+                    if name_lower in cached_outputs:
+                        for item_id, score in cached_outputs[name_lower]:
+                            candidates[item_id] += score * weight
+                
+                sorted_items = sorted(candidates.items(), key=lambda x: x[1], reverse=True)[:final_k]
+                rec_list = [item_id for item_id, _ in sorted_items]
+                
+                reward = compute_ndcg_at_k(rec_list, ground_truth, final_k)
+                rewards.append(reward)
+                # Compute eval metrics
+                metrics_ndcg10.append(compute_ndcg_at_k(rec_list, ground_truth, 10))
+                metrics_ndcg50.append(compute_ndcg_at_k(rec_list, ground_truth, 50))
+                metrics_recall10.append(recall_at_k(rec_list, ground_truth, 10))
+                metrics_recall50.append(recall_at_k(rec_list, ground_truth, 50))
+            except Exception as e:
+                logger.warning(f"Classification reward error: {e}")
+                rewards.append(0.0)
+                metrics_ndcg10.append(0.0)
+                metrics_ndcg50.append(0.0)
+                metrics_recall10.append(0.0)
+                metrics_recall50.append(0.0)
+        
+        rewards_tensor = torch.tensor(rewards, device=device, dtype=torch.float32)
+        
+        # Gather rewards and compute advantages (GRPO group normalization)
+        rewards_gathered = gather(rewards_tensor)
+        mean_grouped = rewards_gathered.view(-1, self.num_generations).mean(dim=1)
+        mean_grouped = mean_grouped.repeat_interleave(self.num_generations, dim=0)
+        advantages = rewards_gathered - mean_grouped
+        
+        if self.scale_rewards in ["group", "none"]:
+            std_rewards = rewards_gathered.view(-1, self.num_generations).std(dim=1)
+            std_rewards = std_rewards.repeat_interleave(self.num_generations, dim=0)
+        elif self.scale_rewards == "batch":
+            std_rewards = rewards_gathered.std().expand_as(rewards_gathered)
+        else:
+            raise ValueError(f"Invalid scale_rewards: {self.scale_rewards}")
+        
+        if self.scale_rewards != "none":
+            advantages = advantages / (std_rewards + 1e-4)
+        
+        # Slice for local process
+        process_slice = slice(
+            self.accelerator.process_index * len(prompts),
+            (self.accelerator.process_index + 1) * len(prompts),
+        )
+        advantages = advantages[process_slice]
+        
+        # Log metrics
+        self._metrics[mode]["reward"].append(rewards_gathered.mean().item())
+        self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
+        self._metrics[mode]["ndcg@10"].append(sum(metrics_ndcg10) / len(metrics_ndcg10))
+        self._metrics[mode]["ndcg@50"].append(sum(metrics_ndcg50) / len(metrics_ndcg50))
+        self._metrics[mode]["recall@10"].append(sum(metrics_recall10) / len(metrics_recall10))
+        self._metrics[mode]["recall@50"].append(sum(metrics_recall50) / len(metrics_recall50))
+        
+        # Create dummy completion tensors (classification doesn't generate text)
+        # Use prompt_ids as completion_ids placeholder
+        completion_ids = torch.zeros((prompt_ids.size(0), 1), dtype=torch.long, device=device)
+        completion_mask = torch.ones_like(completion_ids)
+        
+        output = {
+            "prompt_ids": prompt_ids.to(device),
+            "prompt_mask": prompt_mask.to(device),
+            "completion_ids": completion_ids,
+            "completion_mask": completion_mask,
+            "advantages": advantages,
+            "old_logits": old_logits,  # Cache old logits for importance ratio
+            "gumbel_caches": gumbel_caches,  # Cache Gumbel-Softmax sampling info for importance ratio
+            "num_items_in_batch": torch.tensor(len(prompts), device=device),
+            # use_classification_loss determined by self.use_pure_classification
+        }
+        return output
+
     # --- SOFT TOKEN BETA-SAMPLING PATH ---
     def _build_soft_template(self) -> str:
         """Build a minimal JSON template containing [num][soft_token] placeholders."""
@@ -1807,12 +2008,142 @@ class GRPOTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
+        # Pure classification GRPO loss (determined by class attribute, not batch)
+        if getattr(self, "use_pure_classification", False):
+            return self._compute_classification_loss(model, inputs)
         if self.use_liger_loss:
             # Compute the loss using the liger grpo loss
             unwrapped_model = self.accelerator.unwrap_model(model)
             return self._forward_redirection(model, unwrapped_model, self.compute_liger_loss, unwrapped_model, inputs)
         else:
             return self._compute_loss(model, inputs)
+    
+    def _compute_classification_loss(self, model, inputs):
+        """
+        Compute GRPO loss for classification models (Pure GRPO).
+        
+        Supports two loss types (controlled by self.use_soft_grpo_loss):
+        - SofT-GRPO (default): Gumbel reparameterization trick from https://arxiv.org/pdf/2511.06411
+        - PPO-style: Standard importance sampling with clipping
+        """
+        device = self.accelerator.device
+        mode = "train" if model.training else "eval"
+        
+        prompt_ids = inputs["prompt_ids"]
+        prompt_mask = inputs["prompt_mask"]
+        advantages = inputs["advantages"]
+        old_logits = inputs["old_logits"]
+        gumbel_caches = inputs.get("gumbel_caches", None)
+        
+        # Forward pass with current model
+        outputs = model(
+            input_ids=prompt_ids,
+            attention_mask=prompt_mask,
+        )
+        new_logits = outputs.logits  # (batch_size, num_classes)
+        
+        # Choose loss type: SofT-GRPO (default) or PPO-style
+        use_soft_grpo = getattr(self, 'use_soft_grpo_loss', True)
+        
+        if use_soft_grpo and gumbel_caches is not None and len(gumbel_caches) > 0:
+            # ============== SofT-GRPO Loss (Gumbel Reparameterization) ==============
+            # Based on: https://arxiv.org/pdf/2511.06411
+            # Loss function: f(z) = -z - exp(-z), where z = g' - log(p)
+            # g' is Gumbel noise, cached as: q_prime = log_p_old + g'
+            # Gradient: advantage * [f(z_new) - f(z_old)]
+            
+            soft_grpo_losses = []
+            z_diff_means = []
+            
+            for i, cache in enumerate(gumbel_caches):
+                support_indices = cache.support_indices.to(device)
+                q_prime = cache.q_prime.to(device)  # log_p_old + g' (on support)
+                
+                # Get log probabilities on support set and renormalize (same as sampling)
+                old_probs_full = F.softmax(old_logits[i], dim=-1)
+                old_support_probs = old_probs_full[support_indices]
+                old_support_probs = old_support_probs / (old_support_probs.sum() + 1e-10)
+                old_log_support = torch.log(old_support_probs + 1e-10)
+                
+                new_probs_full = F.softmax(new_logits[i], dim=-1)
+                new_support_probs = new_probs_full[support_indices]
+                new_support_probs = new_support_probs / (new_support_probs.sum() + 1e-10)
+                new_log_support = torch.log(new_support_probs + 1e-10)
+                
+                # z = g' - log(p), where g' = q_prime - log_p_old
+                # z_new = g' - log_p_new, z_old = g' - log_p_old
+                # Simplified: z_new - z_old = log_p_old - log_p_new
+                z_diff = old_log_support.detach() - new_log_support  # = z_new - z_old
+                
+                # f(z_new) - f(z_old) where f(z) = -z - exp(-z)
+                # = -(z_new - z_old) - (exp(-z_new) - exp(-z_old))
+                # = -z_diff - (exp(-z_new) - exp(-z_old))
+                g_prime = (q_prime - old_log_support).detach()  # Gumbel noise
+                z_new = g_prime - new_log_support
+                z_old = g_prime - old_log_support.detach()
+                
+                # Clamp for numerical stability
+                z_new_clamped = torch.clamp(z_new, -20, 20)
+                z_old_clamped = torch.clamp(z_old, -20, 20)
+                
+                f_diff = -z_diff - (torch.exp(-z_new_clamped) - torch.exp(-z_old_clamped))
+                
+                # Sum over support set (per-sample loss)
+                sample_loss = f_diff.sum()
+                soft_grpo_losses.append(sample_loss)
+                z_diff_means.append(z_diff.mean().item())
+            
+            # Weighted by advantages: loss = -E[A * (f_new - f_old)]
+            soft_grpo_losses = torch.stack(soft_grpo_losses)
+            loss = -(advantages * soft_grpo_losses).mean()
+            
+            # Log SofT-GRPO specific metrics
+            self._metrics[mode]["z_diff_mean"].append(sum(z_diff_means) / len(z_diff_means))
+            
+        else:
+            # ============== PPO-style Loss (Importance Sampling) ==============
+            # Fallback when no Gumbel cache or explicitly disabled
+            
+            if gumbel_caches is not None and len(gumbel_caches) > 0:
+                sampled_weights = torch.stack([cache.y_soft for cache in gumbel_caches]).to(device)
+            else:
+                sampled_weights = F.softmax(old_logits, dim=-1)
+            
+            old_log_probs = F.log_softmax(old_logits, dim=-1)
+            new_log_probs = F.log_softmax(new_logits, dim=-1)
+            
+            old_log_prob = torch.sum(sampled_weights * old_log_probs, dim=-1)
+            new_log_prob = torch.sum(sampled_weights * new_log_probs, dim=-1)
+            
+            log_ratio = new_log_prob - old_log_prob.detach()
+            ratio = torch.exp(log_ratio)
+            ratio_clipped = torch.clamp(ratio, 1 - self.epsilon_low, 1 + self.epsilon_high)
+            
+            loss1 = ratio * advantages
+            loss2 = ratio_clipped * advantages
+            loss = -torch.min(loss1, loss2).mean()
+            
+            self._metrics[mode]["ratio"].append(self.accelerator.gather(ratio.mean()).mean().item())
+        
+        # Optional KL penalty with reference model
+        if self.beta != 0.0 and self.ref_model is not None:
+            with torch.no_grad():
+                ref_outputs = self.ref_model(
+                    input_ids=prompt_ids,
+                    attention_mask=prompt_mask,
+                )
+                ref_logits = ref_outputs.logits
+            
+            new_probs = torch.softmax(new_logits, dim=-1)
+            ref_probs = torch.softmax(ref_logits, dim=-1)
+            kl = (new_probs * (torch.log(new_probs + 1e-10) - torch.log(ref_probs + 1e-10))).sum(dim=-1).mean()
+            loss = loss + self.beta * kl
+            self._metrics[mode]["kl"].append(self.accelerator.gather(kl).mean().item())
+        
+        # Log metrics
+        self._metrics[mode]["advantages_mean"].append(self.accelerator.gather(advantages.mean()).mean().item())
+        
+        return loss / self.current_gradient_accumulation_steps
 
     def _compute_loss(self, model, inputs):
         # Compute the per-token log probabilities for the model
@@ -2110,3 +2441,5 @@ class GRPOTrainer(Trainer):
         )
 
         model_card.save(os.path.join(self.args.output_dir, "README.md"))
+
+

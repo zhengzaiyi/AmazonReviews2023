@@ -8,6 +8,7 @@ cd /home/zzheng3/AmazonReviews2023
 python GRPO/main_trl.py \
     --use_hf_local \
     --dataset $1 \
+    --checkpoint_dir checkpoints_test \
     --data_path dataset \
     --recbole_models BPR ItemKNN FPMC Pop SASRec LightGCN SimpleX\
     --do_test_recaller \

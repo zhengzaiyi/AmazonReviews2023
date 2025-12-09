@@ -15,7 +15,7 @@ def create_recaller(model_name: str, dataset_name: str, checkpoint_dir: str, dat
     """Create a recaller with proper configuration for the specified model"""
     
     # Find checkpoint if requested
-    checkpoint_path = f"checkpoints/{dataset_name}"
+    checkpoint_path = f"{checkpoint_dir}/{dataset_name}"
     if not os.path.exists(checkpoint_path):
         os.makedirs(checkpoint_path)
 

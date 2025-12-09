@@ -43,10 +43,11 @@ python GRPO/main_soft.py \
     --dataset $1 \
     --data_path dataset \
     --model_name meta-llama/Llama-3.2-1B-Instruct \
+    --recbole_models BPR SASRec \
     --output_dir GRPO/soft_models \
     --final_k 50 \
     --norm_type oracle \
-    --num_train_samples 1000 \
+    --num_train_samples 1000000 \
     --seed 42
 
 # export CUDA_VISIBLE_DEVICES=6,7
@@ -59,9 +60,10 @@ python GRPO/main_soft.py \
     --data_path dataset \
     --model_name meta-llama/Llama-3.2-1B-Instruct \
     --output_dir GRPO/soft_models \
-    --num_train_epochs 3 \
-    --per_device_train_batch_size 8 \
-    --learning_rate 5e-5 \
+    --num_train_epochs 15 \
+    --per_device_train_batch_size 4 \
+    --recbole_models BPR SASRec \
+    --learning_rate 1e-5 \
     --warmup_steps 100 \
     --logging_steps 10 \
     --save_steps 500 \

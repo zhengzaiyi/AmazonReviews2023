@@ -4,6 +4,7 @@ import os
 import random
 from functools import partial
 from typing import List
+import numpy as np
 
 import outlines
 import torch
@@ -58,37 +59,68 @@ def create_sft_dataset(
     recallers: List[RecBoleRecaller],
     final_k: int,
     norm_type: str = 'static', # oracle, static
+    profile_cutoff: int = 20,
+    min_history_for_augmentation: int = 30,
+    augmentation_step: int = 10,
 ):
     dataset = []
     metrics = {recaller: defaultdict(list) for recaller in recallers.keys()}
+    
     for i, uid in enumerate(user_ids):
         hist = histories[i]
         if 0 in hist:
             hist = hist[:hist.index(0)]
+        
+        # Determine history lengths for augmentation (from main_pure.py)
+        history_lengths = [len(hist)]
+        if len(hist) >= min_history_for_augmentation:
+            history_lengths = list(range(profile_cutoff, len(hist), augmentation_step)) + [len(hist)]
+        
+        for hist_len in history_lengths:
+            current_hist = hist[:hist_len]
+            
+            # Prepare ground-truth (20% of history + target) - from main_pure.py
+            n_gt = max(1, min(5, int(len(current_hist) * 0.2)))
+            if len(current_hist) > 1:
+                gt_items = current_hist[-n_gt:] + [target_items[i]]
+                eval_hist = current_hist[:-n_gt]
+        else:
+            gt_items = [target_items[i]]
+            eval_hist = current_hist
+        
+            # Skip if evaluation history too short
+        if len(eval_hist) < 5:
+            continue
+        
+            # Find best recaller using eval_hist and gt_items
         best_ndcg, best_recaller = -1, None
         for recaller_name in recallers.keys():
-            items = recallers[recaller_name].recall(uid, int(final_k), histories[i])
+            items = recallers[recaller_name].recall(uid, int(final_k), eval_hist)
             item_ids = [item[0] for item in items] if items else []
-            metrics[recaller_name]["ndcg"].append(ndcg_at_k(item_ids, [target_items[i]], k=final_k))
-            metrics[recaller_name]["recall@10"].append(recall_at_k(item_ids, [target_items[i]], k=10))
-            if metrics[recaller_name]["ndcg"][-1] > best_ndcg:
-                best_ndcg = metrics[recaller_name]["ndcg"][-1]
+            ndcg = ndcg_at_k(item_ids, gt_items, k=final_k)
+            metrics[recaller_name]["ndcg"].append(ndcg)
+            metrics[recaller_name]["recall@10"].append(recall_at_k(item_ids, gt_items, k=10))
+                
+            if ndcg > best_ndcg:
+                best_ndcg = ndcg
                 best_recaller = recaller_name
+                    
         assert best_recaller is not None
-        prompt = build_prompt(profile_agent.forward(user_ids[i], hist), available_models=recallers.keys())
+            
+            # Generate prompt using eval_hist with profile_cutoff
+        prompt = build_prompt(profile_agent.forward(uid, eval_hist, cut_off=profile_cutoff), available_models=recallers.keys())
         if norm_type == 'oracle':
             ground_truth_output = {
                 recaller_name: {
-                    "top-k": final_k if recaller_name == best_recaller else 0,
+                        "top-k": final_k if recaller_name == best_recaller else 0,
                     "score-weight": 1.0 if recaller_name == best_recaller else 0.0
                 } for recaller_name in recallers.keys()
             }
         elif norm_type == 'static':
-            recaller_scores = {name: ndcg_at_k([item[0] for item in items], target_items[i], k=final_k) 
-                            if (items := recallers[name].recall(user_ids[i], final_k, histories[i])) else 0
+            recaller_scores = {name: ndcg_at_k([item[0] for item in items], gt_items, k=final_k) 
+                            if (items := recallers[name].recall(uid, final_k, eval_hist)) else 0
                             for name in recallers.keys()}
             
-            import numpy as np
             scores = np.array(list(recaller_scores.values()))
             weights = np.exp(scores * 2) / np.exp(scores * 2).sum()  # softmax with temperature=0.5
             weights = weights * 0.9 + np.random.dirichlet(np.ones(len(weights))) * 0.1  # 10% noise
@@ -96,10 +128,10 @@ def create_sft_dataset(
             total_k = int(final_k * 1.5)
             k_values = np.maximum(5, (weights * total_k).astype(int))
             k_values = (k_values * min(1, total_k / k_values.sum())).astype(int)
-            
+                
             ground_truth_output = {
-                name: {"top-k": int(k), "score-weight": float(w)}
-                for name, k, w in zip(recaller_scores.keys(), k_values, weights/weights.sum())
+                    name: {"top-k": int(k), "score-weight": float(w)}
+                    for name, k, w in zip(recaller_scores.keys(), k_values, weights/weights.sum())
             }
         else:
             raise ValueError(f"Invalid norm type: {norm_type}")
@@ -107,7 +139,17 @@ def create_sft_dataset(
         dataset.append({
             "prompt": prompt + '\n\n',
             "completion": ground_truth_output,
-        })
+                "user_id": uid,
+                "history_len_used": len(eval_hist),
+            })
+    
+    # Print statistics (from main_pure.py)
+    print(f"\nDataset created: {len(dataset)} samples from {len(set(d['user_id'] for d in dataset))} users")
+    for recaller_name in recallers.keys():
+        if metrics[recaller_name]["ndcg"]:
+            avg_ndcg = np.mean(metrics[recaller_name]["ndcg"])
+            print(f"{recaller_name}: avg NDCG = {avg_ndcg:.4f}")
+    
     return Dataset.from_list(dataset)
 
 def parse_args():

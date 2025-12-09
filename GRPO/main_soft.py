@@ -4,6 +4,7 @@ import os
 import random
 from functools import partial
 from typing import List, Dict
+import numpy as np
 
 import outlines
 import torch
@@ -29,6 +30,10 @@ from GRPO.soft_model import get_model_and_tokenizer, get_mixed_model_and_tokeniz
 from GRPO.soft_sft_trainer import SoftSFTTrainer
 from GRPO.soft_utils import build_soft_template, generate_soft_completions
 
+# Dataset generation configuration (from main_pure.py)
+MIN_HISTORY_FOR_AUGMENTATION = 30
+AUGMENTATION_STEP = 10
+
 def create_sft_dataset(
     profile_agent: UserProfileAgent, 
     user_ids: List[int],
@@ -37,71 +42,112 @@ def create_sft_dataset(
     recallers: List[RecBoleRecaller],
     final_k: int,
     norm_type: str = 'static', # oracle, static
+    profile_cutoff: int = 20,
+    min_history_for_augmentation: int = 30,
+    augmentation_step: int = 10,
 ):
     dataset = []
     metrics = {recaller: defaultdict(list) for recaller in recallers.keys()}
+    
     for i, uid in enumerate(user_ids):
         hist = histories[i]
         if 0 in hist:
             hist = hist[:hist.index(0)]
-        best_ndcg, best_recaller = -1, None
-        for recaller_name in recallers.keys():
-            items = recallers[recaller_name].recall(uid, int(final_k), histories[i])
-            item_ids = [item[0] for item in items] if items else []
-            metrics[recaller_name]["ndcg"].append(ndcg_at_k(item_ids, [target_items[i]], k=final_k))
-            metrics[recaller_name]["recall@10"].append(recall_at_k(item_ids, [target_items[i]], k=10))
-            if metrics[recaller_name]["ndcg"][-1] > best_ndcg:
-                best_ndcg = metrics[recaller_name]["ndcg"][-1]
-                best_recaller = recaller_name
-        assert best_recaller is not None
-        prompt = build_prompt(profile_agent.forward(uid, hist), available_models=recallers.keys())
-        if norm_type == 'oracle':
-            ground_truth_output = {
-                recaller_name: {
-                    "top-k": 1.0 if recaller_name == best_recaller else 0,
-                    "score-weight": 1.0 if recaller_name == best_recaller else 0.0
-                } for recaller_name in recallers.keys()
-            }
-        elif norm_type == 'static':
-            recaller_scores = {name: ndcg_at_k([item[0] for item in items], [target_items[i]], k=final_k) 
-                            if (items := recallers[name].recall(uid, final_k, histories[i])) else 0
-                            for name in recallers.keys()}
-            
-            import numpy as np
-            scores = np.array(list(recaller_scores.values()))
-            weights = np.exp(scores) / np.exp(scores).sum()  # softmax with temperature=0.5
-
-            k_values = weights / weights.sum()
-            
-            # k_values is already normalized by final_k, so it should be in a reasonable range
-            # We keep the normalized k_values (not converting back to int) for Beta distribution
-            ground_truth_output = {
-                name: {"top-k": float(k), "score-weight": float(w)}
-                for name, k, w in zip(recaller_scores.keys(), k_values, weights/weights.sum())
-            }
-        else:
-            raise ValueError(f"Invalid norm type: {norm_type}")
         
-        completion_lines = ["{"]
-        value_targets = []
-        for recaller_name in recallers.keys():
-            completion_lines.append(f"  {recaller_name}: {{")
-            inner_lines = []
-            hparams = ['top-k', 'score-weight']
-            for hp_idx, hp in enumerate(hparams):
-                suffix = "," if hp_idx < len(hparams) - 1 else ""
-                inner_lines.append(f"    {hp}: [num][soft_token]{suffix}")
-                value_targets.append(float(ground_truth_output[recaller_name][hp]))
-            completion_lines.extend(inner_lines)
-            completion_lines.append("  },")
-        completion_lines[-1] = completion_lines[-1].rstrip(",")
-        completion_lines.append("}")
-        completion = "\n".join(completion_lines)
-        dataset.append({
-            "prompt": prompt + "\n\n",
-            "completion": completion,
-            "value_targets": value_targets,
-        })
+        # Determine history lengths for augmentation (from main_pure.py)
+        history_lengths = [len(hist)]
+        if len(hist) >= min_history_for_augmentation:
+            history_lengths = list(range(profile_cutoff, len(hist), augmentation_step)) + [len(hist)]
+        
+        for hist_len in history_lengths:
+            current_hist = hist[:hist_len]
+            
+            # Prepare ground-truth (20% of history + target) - from main_pure.py
+            n_gt = max(1, min(5, int(len(current_hist) * 0.2)))
+            if len(current_hist) > 1:
+                gt_items = current_hist[-n_gt:] + [target_items[i]]
+                eval_hist = current_hist[:-n_gt]
+            else:
+                gt_items = [target_items[i]]
+                eval_hist = current_hist
+            
+            # Skip if evaluation history too short
+            if len(eval_hist) < 5:
+                continue
+            
+            # Find best recaller using eval_hist and gt_items
+            best_ndcg, best_recaller = -1, None
+            for recaller_name in recallers.keys():
+                items = recallers[recaller_name].recall(uid, int(final_k), eval_hist)
+                item_ids = [item[0] for item in items] if items else []
+                ndcg = ndcg_at_k(item_ids, gt_items, k=final_k)
+                metrics[recaller_name]["ndcg"].append(ndcg)
+                metrics[recaller_name]["recall@10"].append(recall_at_k(item_ids, gt_items, k=10))
+                
+                if ndcg > best_ndcg:
+                    best_ndcg = ndcg
+                    best_recaller = recaller_name
+                    
+            assert best_recaller is not None
+            
+            # Generate prompt using eval_hist with profile_cutoff
+            prompt = build_prompt(profile_agent.forward(uid, eval_hist, cut_off=profile_cutoff), available_models=recallers.keys())
+            if norm_type == 'oracle':
+                ground_truth_output = {
+                    recaller_name: {
+                        "top-k": 1.0 if recaller_name == best_recaller else 0,
+                        "score-weight": 1.0 if recaller_name == best_recaller else 0.0
+                    } for recaller_name in recallers.keys()
+                }
+            elif norm_type == 'static':
+                recaller_scores = {name: ndcg_at_k([item[0] for item in items], gt_items, k=final_k) 
+                                if (items := recallers[name].recall(uid, final_k, eval_hist)) else 0
+                                for name in recallers.keys()}
+                
+                scores = np.array(list(recaller_scores.values()))
+                weights = np.exp(scores) / np.exp(scores).sum()  # softmax with temperature=0.5
+
+                k_values = weights / weights.sum()
+                
+                # k_values is already normalized by final_k, so it should be in a reasonable range
+                # We keep the normalized k_values (not converting back to int) for Beta distribution
+                ground_truth_output = {
+                    name: {"top-k": float(k), "score-weight": float(w)}
+                    for name, k, w in zip(recaller_scores.keys(), k_values, weights/weights.sum())
+                }
+            else:
+                raise ValueError(f"Invalid norm type: {norm_type}")
+            
+            completion_lines = ["{"]
+            value_targets = []
+            for recaller_name in recallers.keys():
+                completion_lines.append(f"  {recaller_name}: {{")
+                inner_lines = []
+                hparams = ['top-k', 'score-weight']
+                for hp_idx, hp in enumerate(hparams):
+                    suffix = "," if hp_idx < len(hparams) - 1 else ""
+                    inner_lines.append(f"    {hp}: [num][soft_token]{suffix}")
+                    value_targets.append(float(ground_truth_output[recaller_name][hp]))
+                completion_lines.extend(inner_lines)
+                completion_lines.append("  },")
+            completion_lines[-1] = completion_lines[-1].rstrip(",")
+            completion_lines.append("}")
+            completion = "\n".join(completion_lines)
+            dataset.append({
+                "prompt": prompt + "\n\n",
+                "completion": completion,
+                "value_targets": value_targets,
+                "user_id": uid,
+                "history_len_used": len(eval_hist),
+            })
+    
+    # Print statistics (from main_pure.py)
+    print(f"\nDataset created: {len(dataset)} samples from {len(set(d['user_id'] for d in dataset))} users")
+    for recaller_name in recallers.keys():
+        if metrics[recaller_name]["ndcg"]:
+            avg_ndcg = np.mean(metrics[recaller_name]["ndcg"])
+            print(f"{recaller_name}: avg NDCG = {avg_ndcg:.4f}")
+    
     return Dataset.from_list(dataset)
 
 def create_rl_dataset(
@@ -274,7 +320,7 @@ def parse_args():
     ap.add_argument('--data_path', type=str, default='./dataset')
     ap.add_argument('--final_k', type=int, default=50)
     ap.add_argument('--seed', type=int, default=42)
-    ap.add_argument('--recbole_models', type=str, nargs='+', default=['BPR', 'SASRec', 'FPMC', 'Pop', 'ItemKNN'])
+    ap.add_argument('--recbole_models', type=str, nargs='+', default=['BPR', 'SASRec'])
     ap.add_argument('--checkpoint_dir', type=str, default='./checkpoints')
     ap.add_argument('--model_name', type=str, default='Qwen/Qwen2.5-0.5B-Instruct')
     ap.add_argument('--output_dir', type=str, default='GRPO/soft_models')
@@ -290,7 +336,7 @@ def parse_args():
     ap.add_argument('--lora_alpha', type=int, default=32, help='LoRA alpha')
     ap.add_argument('--lora_dropout', type=float, default=0.1, help='LoRA dropout')
     ap.add_argument('--norm_type', type=str, default='static', choices=['oracle', 'static'])
-    ap.add_argument('--num_train_samples', type=int, default=1000, help='Number of training samples')
+    ap.add_argument('--num_train_samples', type=int, default=100000, help='Number of training samples')
     ap.add_argument('--per_device_train_batch_size', type=int, default=2)
     ap.add_argument('--gradient_accumulation_steps', type=int, default=1)
     ap.add_argument('--learning_rate', type=float, default=5e-5)
@@ -308,6 +354,13 @@ def parse_args():
     ap.add_argument('--grpo_batch_size', type=int, default=2, help='Batch size for GRPO training')
     ap.add_argument('--grpo_learning_rate', type=float, default=1e-5, help='Learning rate for GRPO')
     ap.add_argument('--grpo_num_train_epochs', type=int, default=1, help='Number of epochs for GRPO')
+    # Parameters from main_pure.py for dataset creation
+    ap.add_argument('--profile_cutoff', type=int, default=20,
+                   help='Cutoff length for user profiles and minimum history length for augmentation.')
+    ap.add_argument('--min_history_for_augmentation', type=int, default=30,
+                   help='Minimum history length for data augmentation')
+    ap.add_argument('--augmentation_step', type=int, default=10,
+                   help='Step size for history length augmentation')
     args = ap.parse_args()
     return args
 
@@ -365,21 +418,43 @@ def main():
         histories = inter_dataset.train_histories[:cut_off_users]
         target_items = inter_dataset.train_target_items[:cut_off_users]
         
-        sft_dataset = create_sft_dataset(
+        # Create train dataset
+        train_dataset = create_sft_dataset(
             profile_agent=profile_agent,
             user_ids=user_ids,
             histories=histories,
             target_items=target_items,
             recallers=recallers,
             final_k=args.final_k,
-            norm_type=args.norm_type
+            norm_type=args.norm_type,
+            profile_cutoff=args.profile_cutoff,
+            min_history_for_augmentation=args.min_history_for_augmentation,
+            augmentation_step=args.augmentation_step
         )
         
+        # Create eval dataset from test set (like main_pure.py)
+        eval_dataset = create_sft_dataset(
+            profile_agent=profile_agent,
+            user_ids=inter_dataset.test_user_ids[:5000],
+            histories=inter_dataset.test_histories[:5000],
+            target_items=inter_dataset.test_target_items[:5000],
+            recallers=recallers,
+            final_k=args.final_k,
+            norm_type=args.norm_type,
+            profile_cutoff=args.profile_cutoff,
+            min_history_for_augmentation=args.min_history_for_augmentation,
+            augmentation_step=args.augmentation_step
+        )
+        
+        # Save datasets
         if os.path.exists(f'{model_save_dir}_sft_data'):
             import shutil
             shutil.rmtree(f'{model_save_dir}_sft_data')
-        sft_dataset.save_to_disk(f'{model_save_dir}_sft_data')
-        print(f"SFT dataset saved to {model_save_dir}_sft_data")
+        os.makedirs(f'{model_save_dir}_sft_data', exist_ok=True)
+        train_dataset.save_to_disk(f'{model_save_dir}_sft_data/train')
+        eval_dataset.save_to_disk(f'{model_save_dir}_sft_data/eval')
+        print(f"SFT datasets saved to {model_save_dir}_sft_data")
+        print(f"Train: {len(train_dataset)} samples, Eval: {len(eval_dataset)} samples")
         return
     
     if args.do_sft:
@@ -411,12 +486,13 @@ def main():
                 model = get_peft_model(model, peft_config)
                 model.print_trainable_parameters()
             
-            # Load dataset
-            sft_dataset = Dataset.load_from_disk(f'{model_save_dir[:-4]}_sft_data')
-            eval_dataset = sft_dataset.select(range(min(100, len(sft_dataset))))
+            # Load datasets
+            train_dataset = Dataset.load_from_disk(f'{model_save_dir[:-4]}_sft_data/train')
+            eval_dataset = Dataset.load_from_disk(f'{model_save_dir[:-4]}_sft_data/eval')
             
-            print(f"Total training samples: {len(sft_dataset)}")
-            print(f"Sample data point: {sft_dataset[0]}")
+            print(f"Total training samples: {len(train_dataset)}")
+            print(f"Total eval samples: {len(eval_dataset)}")
+            print(f"Sample data point: {train_dataset[0]}")
             
             # Set up training arguments
             sft_config = TrainingArguments(
@@ -429,6 +505,7 @@ def main():
                 save_strategy="steps",
                 save_steps=args.save_steps,
                 logging_steps=args.logging_steps,
+                evaluation_strategy="steps",  # Enable evaluation!
                 eval_steps=args.eval_steps,
                 bf16=True,
                 learning_rate=args.learning_rate,
@@ -437,8 +514,9 @@ def main():
                 gradient_checkpointing=args.gradient_checkpointing,
                 run_name=f"soft_sft_{args.dataset}_lr{args.learning_rate}",
                 report_to="none",
-                metric_for_best_model="loss",
+                metric_for_best_model="eval_loss",  # Use eval_loss instead of loss
                 greater_is_better=False,
+                load_best_model_at_end=True,  # Load best model at the end
                 remove_unused_columns=False,  # Important for custom columns
                 label_names=["labels", "value_labels", "value_mask"],  # Explicitly declare our label fields
                 fp16=args.fp16 and not args.bf16,
@@ -452,7 +530,7 @@ def main():
             trainer = SoftSFTTrainer(
                 model=model,
                 args=sft_config,
-                train_dataset=sft_dataset,
+                train_dataset=train_dataset,
                 eval_dataset=eval_dataset,
                 data_collator=data_collator,
             )
@@ -546,7 +624,7 @@ def main():
         print(f"Testing model: {model_name}")
         
         # Create test dataset
-        cut_off_test_users = min(len(inter_dataset.test_user_ids), 1000)
+        cut_off_test_users = min(len(inter_dataset.test_user_ids), 100000)
         trl_test_dataset = create_rl_dataset(
             profile_agent=profile_agent,
             user_ids=inter_dataset.test_user_ids[:cut_off_test_users],

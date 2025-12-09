@@ -1,53 +1,60 @@
 import argparse
 import json
 import os
-import random
 from functools import partial
-from typing import Any, List, Dict
+from typing import List, Dict, Tuple
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import torch
+from datetime import datetime
+import numpy as np
 from datasets import Dataset
-from peft import LoraConfig, get_peft_model, TaskType
-from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, TrainingArguments, DataCollatorWithPadding, Trainer
+from collections import defaultdict
+from transformers import (
+    AutoModelForSequenceClassification, 
+    AutoModelForSeq2SeqLM,
+    AutoModelForCausalLM,
+    AutoTokenizer, 
+    TrainingArguments, 
+    DataCollatorWithPadding, 
+    DataCollatorForSeq2Seq,
+    Trainer
+)
 from transformers.trainer_utils import get_last_checkpoint
 from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix
-import numpy as np
 
 from GRPO.agents import UserProfileAgent
 from GRPO.data import load_dataset
 from GRPO.main import initialize_recallers
 from GRPO.recallers import RecBoleRecaller
 from GRPO.utils import set_seed, build_prompt, ndcg_at_k, recall_at_k
-from collections import defaultdict
+from GRPO.soft_utils import multi_channel_recall_softmax, compute_ndcg_at_k as soft_ndcg
+from GRPO.trl_trainer import GRPOTrainer
+from GRPO.soft_utils import multi_channel_recall_softmax, compute_ndcg_at_k
+from trl import GRPOConfig
+
+
+# Dataset generation configuration
+MIN_HISTORY_FOR_AUGMENTATION = 30
+AUGMENTATION_STEP = 10
 
 
 def create_sft_dataset(
-    profile_agent: UserProfileAgent, 
+    profile_agent: UserProfileAgent,
     user_ids: List[int],
     histories: List[List[int]],
     target_items: List[int],
-    recallers: List[RecBoleRecaller],
+    recallers: Dict[str, RecBoleRecaller],
     final_k: int,
-):
+    profile_cutoff: int = 20,
+) -> Tuple[Dataset, Dict[str, int], Dict[int, str]]:
     """Create dataset where the model predicts the best recaller class"""
     dataset = []
-    metrics = {recaller: defaultdict[Any, list](list) for recaller in recallers.keys()}
+    metrics = {recaller: defaultdict(list) for recaller in recallers.keys()}
     
-    # Ground-truth configuration options
-    USE_MULTIPLE_GT = True  # Set to True to use multiple ground-truth items
-    GT_RATIO = 0.2  # Use last 20% of history as ground-truth
-    MIN_GT_ITEMS = 1  # Minimum number of ground-truth items
-    MAX_GT_ITEMS = 5  # Maximum number of ground-truth items
-    
-    # Data augmentation configuration
-    PROFILE_CUTOFF = 20  # Number of interactions to show in profile
-    MIN_HISTORY_FOR_AUGMENTATION = 30  # Minimum history length to enable augmentation
-    AUGMENTATION_STEP = 10  # Step size for creating multiple samples
-    
-    # Create label mapping
+    # Create label mappings
     recaller_names = sorted(list(recallers.keys()))
     label2id = {name: i for i, name in enumerate(recaller_names)}
     id2label = {i: name for name, i in label2id.items()}
@@ -57,270 +64,766 @@ def create_sft_dataset(
         if 0 in hist:
             hist = hist[:hist.index(0)]
         
-        # Determine if we should create multiple samples for this user
+        # Determine history lengths for augmentation
+        history_lengths = [len(hist)]
         if len(hist) >= MIN_HISTORY_FOR_AUGMENTATION:
-            # Create multiple samples with different history lengths
-            history_lengths = range(PROFILE_CUTOFF, len(hist), AUGMENTATION_STEP)
-            # Ensure we include the full history as well
-            history_lengths = list(history_lengths) + [len(hist)]
-        else:
-            # Single sample with full history
-            history_lengths = [len(hist)]
+            history_lengths = list(range(profile_cutoff, len(hist), AUGMENTATION_STEP)) + [len(hist)]
         
-        # Create samples for each history length
         for hist_len in history_lengths:
-            # Use only the first hist_len interactions
             current_hist = hist[:hist_len]
             
-            # Determine ground-truth items
-            if USE_MULTIPLE_GT and len(current_hist) > MIN_GT_ITEMS:
-                # Calculate number of ground-truth items from history
-                n_gt = max(MIN_GT_ITEMS, min(MAX_GT_ITEMS, int(len(current_hist) * GT_RATIO)))
-                # Use last n_gt items from history as ground-truth
-                gt_items = current_hist[-n_gt:] + [target_items[i]]  # Include the next item too
-                # Update history to exclude ground-truth items
+            # Prepare ground-truth (20% of history + target)
+            n_gt = max(1, min(5, int(len(current_hist) * 0.2)))
+            if len(current_hist) > 1:
+                gt_items = current_hist[-n_gt:] + [target_items[i]]
                 eval_hist = current_hist[:-n_gt]
             else:
-                # Original behavior: only use the next item as ground-truth
                 gt_items = [target_items[i]]
                 eval_hist = current_hist
             
-            # Skip if eval_hist is too short
             if len(eval_hist) < 5:
                 continue
             
-            # Find the best recaller based on NDCG with multiple ground-truth
+            # Find best recaller
             best_ndcg, best_recaller = -1, None
-            for recaller_name in recallers.keys():
-                items = recallers[recaller_name].recall(uid, int(final_k), eval_hist)  # Use eval_hist
+            for recaller_name, recaller in recallers.items():
+                items = recaller.recall(uid, final_k, eval_hist)
                 item_ids = [item[0] for item in items] if items else []
-                ndcg = ndcg_at_k(item_ids, gt_items, k=final_k)  # Use gt_items list
+                ndcg = ndcg_at_k(item_ids, gt_items, k=final_k)
                 metrics[recaller_name]["ndcg"].append(ndcg)
-                metrics[recaller_name]["recall@10"].append(recall_at_k(item_ids, gt_items, k=10))
                 
                 if ndcg > best_ndcg:
                     best_ndcg = ndcg
                     best_recaller = recaller_name
             
-            assert best_recaller is not None
-            
-            # Create prompt and label for classification with increased cutoff
-            prompt = build_prompt(
-                profile_agent.forward(uid, eval_hist, cut_off=PROFILE_CUTOFF), 
-                available_models=list(recallers.keys()), 
-                type='classification'
-            )
-            label = label2id[best_recaller]
+            # Create sample
+            user_profile = profile_agent.forward(uid, eval_hist, cut_off=profile_cutoff)
+            prompt = build_prompt(user_profile, available_models=recaller_names, type='classification')
             
             dataset.append({
-                "text": prompt,  # For classification, use 'text' field
-                "labels": label,  # Numeric label for classification
-                "best_recaller": best_recaller,  # Keep for analysis
-                "best_ndcg": best_ndcg,  # Store for analysis
-                "num_gt_items": len(gt_items),  # Store number of ground-truth items
-                "user_id": uid,  # Keep track of user
-                "history_len_used": len(eval_hist),  # Track history length used
+                "text": prompt,
+                "prompt": prompt,  # For GRPO compatibility
+                "labels": label2id[best_recaller],
+                "best_recaller": best_recaller,
+                "best_ndcg": best_ndcg,
+                "user_id": uid,
+                "history": eval_hist,  # For GRPO reward computation
+                "target_items": gt_items,  # For GRPO reward computation
+                "history_len_used": len(eval_hist),
             })
     
-    # Print dataset statistics
-    print("\nDataset statistics:")
+    # Print statistics
+    print(f"\nDataset created: {len(dataset)} samples from {len(set(d['user_id'] for d in dataset))} users")
     for recaller_name in recallers.keys():
-        avg_ndcg = sum(metrics[recaller_name]["ndcg"]) / len(metrics[recaller_name]["ndcg"])
-        print(f"{recaller_name}: avg NDCG = {avg_ndcg:.4f}")
+        if metrics[recaller_name]["ndcg"]:
+            avg_ndcg = np.mean(metrics[recaller_name]["ndcg"])
+            print(f"{recaller_name}: avg NDCG = {avg_ndcg:.4f}")
     
-    # Count best model distribution
+    # Best model distribution
     best_model_counts = defaultdict(int)
-    gt_counts = defaultdict(int)
-    unique_users = set()
-    history_len_distribution = defaultdict(int)
-    
     for item in dataset:
         best_model_counts[item["best_recaller"]] += 1
-        gt_counts[item["num_gt_items"]] += 1
-        unique_users.add(item["user_id"])
-        history_len_bucket = (item["history_len_used"] // 10) * 10
-        history_len_distribution[history_len_bucket] += 1
-    
-    print("\nBest model distribution:")
-    for model, count in best_model_counts.items():
+    for model, count in sorted(best_model_counts.items()):
         print(f"{model}: {count} ({count/len(dataset)*100:.1f}%)")
-    
-    print("\nGround-truth items distribution:")
-    for num_gt, count in sorted(gt_counts.items()):
-        print(f"{num_gt} ground-truth items: {count} samples ({count/len(dataset)*100:.1f}%)")
-    
-    print(f"\nData augmentation statistics:")
-    print(f"  - Total samples: {len(dataset)}")
-    print(f"  - Unique users: {len(unique_users)}")
-    print(f"  - Average samples per user: {len(dataset)/len(unique_users):.2f}")
-    
-    print("\nHistory length distribution in samples:")
-    for hist_len, count in sorted(history_len_distribution.items()):
-        print(f"  {hist_len}-{hist_len+9}: {count} samples ({count/len(dataset)*100:.1f}%)")
-    
-    if USE_MULTIPLE_GT:
-        print(f"\nGround-truth configuration:")
-        print(f"  - Using multiple ground-truth: {USE_MULTIPLE_GT}")
-        print(f"  - Ground-truth ratio: {GT_RATIO:.1%}")
-        print(f"  - Min ground-truth items: {MIN_GT_ITEMS}")
-        print(f"  - Max ground-truth items: {MAX_GT_ITEMS}")
-    
-    print(f"\nData augmentation configuration:")
-    print(f"  - Profile cutoff: {PROFILE_CUTOFF}")
-    print(f"  - Min history for augmentation: {MIN_HISTORY_FOR_AUGMENTATION}")
-    print(f"  - Augmentation step: {AUGMENTATION_STEP}")
     
     return Dataset.from_list(dataset), label2id, id2label
 
 
 def compute_metrics(eval_pred):
     """Compute metrics for classification"""
-    predictions, labels = eval_pred
-    predictions = np.argmax(predictions, axis=1)
-    
-    accuracy = accuracy_score(labels, predictions)
-    f1_macro = f1_score(labels, predictions, average='macro')
-    f1_weighted = f1_score(labels, predictions, average='weighted')
-    
+    predictions = np.argmax(eval_pred.predictions, axis=1)
     return {
-        'accuracy': accuracy,
-        'f1_macro': f1_macro,
-        'f1_weighted': f1_weighted
+        'accuracy': accuracy_score(eval_pred.label_ids, predictions),
+        'f1_macro': f1_score(eval_pred.label_ids, predictions, average='macro'),
+        'f1_weighted': f1_score(eval_pred.label_ids, predictions, average='weighted')
     }
 
 
-def evaluate_pure_model(
-    model,
-    tokenizer,
-    test_dataset,
-    id2label,
-    device="cuda"
-):
-    """Evaluate the pure classification model"""
+def compute_metrics_seq2seq(eval_pred, tokenizer, label2id):
+    """Compute metrics for seq2seq generation"""
+    predictions, labels = eval_pred
+    
+    # If predictions are logits, take argmax to get token ids
+    if predictions.ndim == 3:  # (batch_size, seq_len, vocab_size)
+        predictions = np.argmax(predictions, axis=-1)
+    
+    # Replace -100 with pad_token_id for decoding
+    labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+    
+    # Decode predictions and labels
+    decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
+    decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+    
+    # Convert text predictions to label ids
+    pred_label_ids = []
+    true_label_ids = []
+    
+    for pred_text, true_text in zip(decoded_preds, decoded_labels):
+        # Clean up text
+        pred_text = pred_text.strip()
+        true_text = true_text.strip()
+        
+        # Map to label ids
+        pred_id = label2id.get(pred_text, -1)  # -1 for unknown predictions
+        true_id = label2id.get(true_text, -1)
+        
+        pred_label_ids.append(pred_id)
+        true_label_ids.append(true_id)
+    
+    pred_label_ids = np.array(pred_label_ids)
+    true_label_ids = np.array(true_label_ids)
+    
+    # Only evaluate on valid predictions
+    valid_mask = (pred_label_ids != -1) & (true_label_ids != -1)
+    
+    if np.sum(valid_mask) == 0:
+        return {'accuracy': 0.0, 'f1_macro': 0.0, 'f1_weighted': 0.0, 'valid_predictions': 0}
+    
+    valid_preds = pred_label_ids[valid_mask]
+    valid_labels = true_label_ids[valid_mask]
+    
+    return {
+        'accuracy': accuracy_score(valid_labels, valid_preds),
+        'f1_macro': f1_score(valid_labels, valid_preds, average='macro'),
+        'f1_weighted': f1_score(valid_labels, valid_preds, average='weighted'),
+        'valid_predictions': np.sum(valid_mask) / len(pred_label_ids)
+    }
+
+
+def evaluate_pure_model(model, tokenizer, test_dataset, id2label, recallers=None, final_k=50, eval_data=None):
+    """Evaluate the pure classification model and generate recommendations"""
+    device = model.device
     model.eval()
-    all_predictions = []
-    all_labels = []
+    
+    all_predictions, all_labels = [], []
+    recommendation_results = []
+    
+    # Create a mapping from dataset index to original data if eval_data is provided
+    data_mapping = {}
+    if eval_data is not None:
+        # Map user_id to original data
+        for i, uid in enumerate(eval_data['user_ids']):
+            data_mapping[uid] = {
+                'history': eval_data['histories'][i],
+                'target_item': eval_data['target_items'][i],
+                'index': i
+            }
     
     with torch.no_grad():
-        for example in tqdm(test_dataset, desc="Evaluating"):
-            # Prepare input
-            inputs = tokenizer(example["text"], return_tensors="pt", truncation=True, max_length=1536, padding=True)
+        for idx, example in enumerate(tqdm(test_dataset, desc="Evaluating")):
+            inputs = tokenizer(example["text"], return_tensors="pt", truncation=True, 
+                             max_length=1536, padding=True)
             inputs = {k: v.to(device) for k, v in inputs.items()}
             
-            # Get prediction
             outputs = model(**inputs)
             prediction = torch.argmax(outputs.logits, dim=-1).cpu().numpy()[0]
             
             all_predictions.append(prediction)
             all_labels.append(example["labels"])
+            
+            # Generate recommendations if recallers are provided
+            if recallers is not None and eval_data is not None:
+                predicted_recaller_name = id2label[prediction]
+                true_recaller_name = example["best_recaller"]
+                
+                # Get user data from example
+                user_id = example["user_id"]
+                history_len = example["history_len_used"]
+                
+                # Get original data for this user
+                if user_id in data_mapping:
+                    orig_data = data_mapping[user_id]
+                    full_history = orig_data['history']
+                    target_item = orig_data['target_item']
+                    
+                    # Remove zeros from history
+                    if 0 in full_history:
+                        full_history = full_history[:full_history.index(0)]
+                    
+                    # Reconstruct evaluation history (similar to create_sft_dataset logic)
+                    # Use 20% of history as ground truth, rest as evaluation history
+                    n_gt = max(1, min(5, int(len(full_history) * 0.2)))
+                    if len(full_history) > 1:
+                        gt_items = full_history[-n_gt:] + [target_item]
+                        eval_hist = full_history[:-n_gt]
+                    else:
+                        gt_items = [target_item]
+                        eval_hist = full_history
+                    
+                    # Ensure we have the right history length
+                    eval_hist = eval_hist[:history_len] if len(eval_hist) > history_len else eval_hist
+                    
+                    # Generate recommendations using predicted recaller
+                    if predicted_recaller_name in recallers and len(eval_hist) >= 5:
+                        predicted_recaller = recallers[predicted_recaller_name]
+                        pred_items = predicted_recaller.recall(user_id, final_k, eval_hist)
+                        pred_item_ids = [item[0] for item in pred_items] if pred_items else []
     
-    # Convert to numpy arrays
+    # Calculate metrics
+                        pred_ndcg = ndcg_at_k(pred_item_ids, gt_items, k=final_k)
+                        pred_recall = recall_at_k(pred_item_ids, gt_items, k=final_k)
+                    else:
+                        pred_item_ids = []
+                        pred_ndcg = 0.0
+                        pred_recall = 0.0
+                    
+                    # Generate recommendations using true recaller for comparison
+                    if true_recaller_name in recallers and len(eval_hist) >= 5:
+                        true_recaller = recallers[true_recaller_name]
+                        true_items = true_recaller.recall(user_id, final_k, eval_hist)
+                        true_item_ids = [item[0] for item in true_items] if true_items else []
+                        true_ndcg = ndcg_at_k(true_item_ids, gt_items, k=final_k)
+                        true_recall = recall_at_k(true_item_ids, gt_items, k=final_k)
+                    else:
+                        true_item_ids = []
+                        true_ndcg = 0.0
+                        true_recall = 0.0
+                    
+                    recommendation_results.append({
+                        "user_id": user_id,
+                        "predicted_recaller": predicted_recaller_name,
+                        "true_recaller": true_recaller_name,
+                        "predicted_items": pred_item_ids[:10],  # Top 10 for display
+                        "true_items": true_item_ids[:10],  # Top 10 for display
+                        "ground_truth": gt_items,
+                        "predicted_ndcg": pred_ndcg,
+                        "true_ndcg": true_ndcg,
+                        "predicted_recall": pred_recall,
+                        "true_recall": true_recall,
+                        "correct_prediction": predicted_recaller_name == true_recaller_name,
+                        "history_length": len(eval_hist)
+                    })
+    
+    # Calculate classification metrics
     all_predictions = np.array(all_predictions)
     all_labels = np.array(all_labels)
     
-    # Calculate metrics
     accuracy = accuracy_score(all_labels, all_predictions)
     f1_macro = f1_score(all_labels, all_predictions, average='macro')
-    f1_weighted = f1_score(all_labels, all_predictions, average='weighted')
     
-    print(f"\n=== Evaluation Results ===")
-    print(f"Accuracy: {accuracy:.4f}")
-    print(f"F1 Score (Macro): {f1_macro:.4f}")
-    print(f"F1 Score (Weighted): {f1_weighted:.4f}")
-    
-    # Print classification report
-    print("\n=== Classification Report ===")
+    print(f"\nAccuracy: {accuracy:.4f}, F1 Macro: {f1_macro:.4f}")
+    print("\nClassification Report:")
     print(classification_report(all_labels, all_predictions, target_names=list(id2label.values())))
     
-    # Print confusion matrix
-    print("\n=== Confusion Matrix ===")
-    cm = confusion_matrix(all_labels, all_predictions)
-    print("Labels:", [id2label[i] for i in range(len(id2label))])
-    print(cm)
-    
-    # Class distribution statistics
-    print("\n=== Class Distribution ===")
-    pred_counts = defaultdict(int)
-    true_counts = defaultdict(int)
-    
-    for pred in all_predictions:
-        pred_counts[id2label[pred]] += 1
-    for label in all_labels:
-        true_counts[id2label[label]] += 1
-        
-    print("\nTrue Label Distribution:")
-    total = len(all_labels)
-    for model_name in sorted(true_counts.keys()):
-        count = true_counts[model_name]
-        print(f"{model_name}: {count} ({count/total*100:.1f}%)")
-        
-    print("\nPredicted Label Distribution:")
-    for model_name in sorted(pred_counts.keys()):
-        count = pred_counts[model_name]
-        print(f"{model_name}: {count} ({count/total*100:.1f}%)")
-    
-    return {
+    result = {
         "accuracy": accuracy,
         "f1_macro": f1_macro,
-        "f1_weighted": f1_weighted,
         "predictions": all_predictions.tolist(),
         "labels": all_labels.tolist(),
-        "confusion_matrix": cm.tolist(),
-        "classification_report": classification_report(all_labels, all_predictions, target_names=list(id2label.values()), output_dict=True)
+        "confusion_matrix": confusion_matrix(all_labels, all_predictions).tolist()
+    }
+
+    # Add recommendation metrics if available
+    if recommendation_results:
+        avg_pred_ndcg = np.mean([r["predicted_ndcg"] for r in recommendation_results])
+        avg_true_ndcg = np.mean([r["true_ndcg"] for r in recommendation_results])
+        avg_pred_recall = np.mean([r["predicted_recall"] for r in recommendation_results])
+        avg_true_recall = np.mean([r["true_recall"] for r in recommendation_results])
+        correct_predictions = sum([r["correct_prediction"] for r in recommendation_results])
+        
+        # Calculate improvement/degradation metrics
+        ndcg_improvement = avg_pred_ndcg - avg_true_ndcg
+        recall_improvement = avg_pred_recall - avg_true_recall
+        
+        print(f"\nRecommendation Metrics:")
+        print(f"Average Predicted NDCG@{final_k}: {avg_pred_ndcg:.4f}")
+        print(f"Average True Best NDCG@{final_k}: {avg_true_ndcg:.4f}")
+        print(f"NDCG Improvement: {ndcg_improvement:+.4f}")
+        print(f"Average Predicted Recall@{final_k}: {avg_pred_recall:.4f}")
+        print(f"Average True Best Recall@{final_k}: {avg_true_recall:.4f}")
+        print(f"Recall Improvement: {recall_improvement:+.4f}")
+        print(f"Correct Recaller Predictions: {correct_predictions}/{len(recommendation_results)} ({correct_predictions/len(recommendation_results)*100:.1f}%)")
+        
+        # Show some examples
+        print(f"\nSample Recommendation Results (first 3):")
+        for i, res in enumerate(recommendation_results[:3]):
+            print(f"User {res['user_id']}: Predicted={res['predicted_recaller']}, True={res['true_recaller']}")
+            print(f"  Predicted NDCG: {res['predicted_ndcg']:.4f}, True NDCG: {res['true_ndcg']:.4f}")
+            print(f"  Predicted items: {res['predicted_items'][:5]}")
+            print(f"  Ground truth: {res['ground_truth']}")
+            print()
+        
+        result.update({
+            "recommendation_results": recommendation_results,
+            "avg_predicted_ndcg": avg_pred_ndcg,
+            "avg_true_ndcg": avg_true_ndcg,
+            "avg_predicted_recall": avg_pred_recall,
+            "avg_true_recall": avg_true_recall,
+            "ndcg_improvement": ndcg_improvement,
+            "recall_improvement": recall_improvement,
+            "recaller_prediction_accuracy": correct_predictions / len(recommendation_results)
+        })
+    
+    # Evaluate all base recall models for comprehensive comparison
+    if recallers is not None and eval_data is not None and recommendation_results:
+        print(f"\n" + "="*60)
+        print(f"Base Recall Models Performance on Test Set")
+        print(f"="*60)
+        
+        base_model_results = {}
+        
+        # Collect all evaluation instances with valid histories
+        valid_eval_instances = []
+        for res in recommendation_results:
+            if res['history_length'] >= 5:  # Only include instances with sufficient history
+                valid_eval_instances.append(res)
+        
+        print(f"Evaluating {len(valid_eval_instances)} valid instances on {len(recallers)} base models...")
+        
+        for recaller_name, recaller in recallers.items():
+            model_ndcgs = []
+            model_recalls = []
+            
+            for res in tqdm(valid_eval_instances, desc=f"Evaluating {recaller_name}", leave=False):
+                user_id = res['user_id']
+                
+                # Get original data for this user
+                if user_id in data_mapping:
+                    orig_data = data_mapping[user_id]
+                    full_history = orig_data['history']
+                    target_item = orig_data['target_item']
+                    
+                    # Remove zeros from history
+                    if 0 in full_history:
+                        full_history = full_history[:full_history.index(0)]
+                    
+                    # Reconstruct evaluation history and ground truth
+                    n_gt = max(1, min(5, int(len(full_history) * 0.2)))
+                    if len(full_history) > 1:
+                        gt_items = full_history[-n_gt:] + [target_item]
+                        eval_hist = full_history[:-n_gt]
+                    else:
+                        gt_items = [target_item]
+                        eval_hist = full_history
+                    
+                    eval_hist = eval_hist[:res['history_length']]
+                    
+                    if len(eval_hist) >= 5:
+                        # Generate recommendations
+                        items = recaller.recall(user_id, final_k, eval_hist)
+                        item_ids = [item[0] for item in items] if items else []
+                        
+                        # Calculate metrics
+                        ndcg = ndcg_at_k(item_ids, gt_items, k=final_k)
+                        recall = recall_at_k(item_ids, gt_items, k=final_k)
+                        
+                        model_ndcgs.append(ndcg)
+                        model_recalls.append(recall)
+            
+            if model_ndcgs:
+                avg_ndcg = np.mean(model_ndcgs)
+                avg_recall = np.mean(model_recalls)
+                base_model_results[recaller_name] = {
+                    "avg_ndcg": avg_ndcg,
+                    "avg_recall": avg_recall,
+                    "num_evaluations": len(model_ndcgs)
+                }
+                print(f"{recaller_name:>12}: NDCG@{final_k}={avg_ndcg:.4f}, Recall@{final_k}={avg_recall:.4f} ({len(model_ndcgs)} evals)")
+        
+        # Add comparison with model predictions
+        print(f"\n" + "-"*60)
+        print(f"Model Selection Performance Summary:")
+        print(f"-"*60)
+        
+        if base_model_results:
+            # Find best base model
+            best_base_ndcg = max(base_model_results.values(), key=lambda x: x["avg_ndcg"])["avg_ndcg"]
+            best_base_recall = max(base_model_results.values(), key=lambda x: x["avg_recall"])["avg_recall"]
+            best_ndcg_model = max(base_model_results.keys(), key=lambda k: base_model_results[k]["avg_ndcg"])
+            best_recall_model = max(base_model_results.keys(), key=lambda k: base_model_results[k]["avg_recall"])
+            
+            print(f"Best Base Model (NDCG): {best_ndcg_model} = {best_base_ndcg:.4f}")
+            print(f"Best Base Model (Recall): {best_recall_model} = {best_base_recall:.4f}")
+            print(f"Model Predicted NDCG: {avg_pred_ndcg:.4f}")
+            print(f"Model Predicted Recall: {avg_pred_recall:.4f}")
+            print(f"True Best Selection NDCG: {avg_true_ndcg:.4f}")
+            print(f"True Best Selection Recall: {avg_true_recall:.4f}")
+            
+            # Calculate gaps
+            ndcg_gap_vs_best_base = avg_pred_ndcg - best_base_ndcg
+            recall_gap_vs_best_base = avg_pred_recall - best_base_recall
+            
+            print(f"\nModel vs Best Base Model:")
+            print(f"NDCG Gap: {ndcg_gap_vs_best_base:+.4f}")
+            print(f"Recall Gap: {recall_gap_vs_best_base:+.4f}")
+            
+            result.update({
+                "base_model_results": base_model_results,
+                "best_base_ndcg": best_base_ndcg,
+                "best_base_recall": best_base_recall,
+                "best_ndcg_model": best_ndcg_model,
+                "best_recall_model": best_recall_model,
+                "ndcg_gap_vs_best_base": ndcg_gap_vs_best_base,
+                "recall_gap_vs_best_base": recall_gap_vs_best_base
+            })
+    
+    return result
+
+
+def multi_channel_recall_average(
+    recallers: Dict,
+    recaller_names: List[str],
+    user_id: int,
+    history: List[int],
+    total_k: int
+) -> List[Tuple[int, float]]:
+    """
+    Multi-channel recall using average (uniform) weights.
+    Each recaller has equal weight = 1/n.
+    """
+    candidates = defaultdict(float)
+    num_recallers = len(recaller_names)
+    weight = 1.0 / num_recallers
+    
+    for name in recaller_names:
+        name_lower = name.lower()
+        if name_lower in recallers:
+            items = recallers[name_lower].recall(user_id, total_k, history)
+            for item_id, score in items:
+                candidates[item_id] += score * weight
+    
+    sorted_items = sorted(candidates.items(), key=lambda x: x[1], reverse=True)
+    return sorted_items[:total_k]
+
+
+def evaluate_multi_channel_recall(
+    model, 
+    tokenizer, 
+    test_dataset, 
+    recallers: Dict[str, RecBoleRecaller],
+    recaller_names: List[str],
+    final_k: int = 50,
+    eval_data=None,
+    use_softmax_weights: bool = True
+):
+    """
+    Evaluate model using multi-channel recall with softmax weights.
+    
+    Instead of selecting a single recaller, uses the softmax output
+    as weights for aggregating candidates from all recallers.
+    """
+    device = model.device
+    model.eval()
+    
+    metrics = {
+        "single_select": defaultdict(list),  # Best single recaller
+        "multi_channel": defaultdict(list),   # Weighted multi-channel (softmax)
+        "avg_score_weight": defaultdict(list),  # Average score-weight (uniform)
+    }
+    # Add metrics for each base recaller
+    for recaller_name in recaller_names:
+        metrics[recaller_name] = defaultdict(list)
+    
+    # Map user_ids to original data
+    data_mapping = {}
+    if eval_data:
+        for i, uid in enumerate(eval_data['user_ids']):
+            data_mapping[uid] = {
+                'history': eval_data['histories'][i],
+                'target_item': eval_data['target_items'][i],
+            }
+    
+    with torch.no_grad():
+        for idx, example in enumerate(tqdm(test_dataset, desc="Evaluating Multi-Channel")):
+            inputs = tokenizer(example["text"], return_tensors="pt", truncation=True, 
+                             max_length=1536, padding=True)
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            
+            outputs = model(**inputs)
+            logits = outputs.logits[0]  # (num_classes,)
+            
+            # Get softmax weights
+            softmax_weights = torch.softmax(logits, dim=-1)
+            
+            # Get user data
+            user_id = example.get("user_id", idx)
+            history_len = example.get("history_len_used", None)
+            if user_id not in data_mapping:
+                continue
+            
+            orig_data = data_mapping[user_id]
+            full_history = orig_data['history']
+            target_item = orig_data['target_item']
+            
+            if 0 in full_history:
+                full_history = full_history[:full_history.index(0)]
+            
+            # Ground truth
+            n_gt = max(1, min(5, int(len(full_history) * 0.2)))
+            if len(full_history) > 1:
+                gt_items = full_history[-n_gt:] + [target_item]
+                eval_hist = full_history[:-n_gt]
+            else:
+                gt_items = [target_item]
+                eval_hist = full_history
+            
+            # Apply history_len truncation (consistent with evaluate_pure_model)
+            if history_len is not None:
+                eval_hist = eval_hist[:history_len] if len(eval_hist) > history_len else eval_hist
+            
+            if len(eval_hist) < 5:
+                continue
+            
+            # 1. Single recaller selection (argmax)
+            pred_idx = logits.argmax().item()
+            pred_recaller = recaller_names[pred_idx]
+            # Use original name for lookup (consistent with evaluate_pure_model)
+            if pred_recaller in recallers:
+                items = recallers[pred_recaller].recall(user_id, final_k, eval_hist)
+                single_rec = [item[0] for item in items]
+                for k in [10, 20, 50]:
+                    metrics["single_select"][f"ndcg@{k}"].append(ndcg_at_k(single_rec, gt_items, k))
+                    metrics["single_select"][f"recall@{k}"].append(recall_at_k(single_rec, gt_items, k))
+            
+            # 2. Multi-channel recall with softmax weights
+            if use_softmax_weights:
+                candidates = multi_channel_recall_softmax(
+                    softmax_weights, recallers, recaller_names,
+                    user_id, eval_hist, final_k
+                )
+                multi_rec = [item_id for item_id, _ in candidates]
+                for k in [10, 20, 50]:
+                    metrics["multi_channel"][f"ndcg@{k}"].append(ndcg_at_k(multi_rec, gt_items, k))
+                    metrics["multi_channel"][f"recall@{k}"].append(recall_at_k(multi_rec, gt_items, k))
+            
+            # 3. Multi-channel recall with average (uniform) score-weight
+            avg_candidates = multi_channel_recall_average(
+                recallers, recaller_names, user_id, eval_hist, final_k
+            )
+            avg_rec = [item_id for item_id, _ in avg_candidates]
+            for k in [10, 20, 50]:
+                metrics["avg_score_weight"][f"ndcg@{k}"].append(ndcg_at_k(avg_rec, gt_items, k))
+                metrics["avg_score_weight"][f"recall@{k}"].append(recall_at_k(avg_rec, gt_items, k))
+            
+            # 4. Evaluate each base recaller
+            for recaller_name in recaller_names:
+                if recaller_name in recallers:
+                    items = recallers[recaller_name].recall(user_id, final_k, eval_hist)
+                    base_rec = [item[0] for item in items] if items else []
+                    for k in [10, 20, 50]:
+                        metrics[recaller_name][f"ndcg@{k}"].append(ndcg_at_k(base_rec, gt_items, k))
+                        metrics[recaller_name][f"recall@{k}"].append(recall_at_k(base_rec, gt_items, k))
+    
+    # Aggregate results
+    results = {}
+    for method, method_metrics in metrics.items():
+        results[method] = {}
+        for metric_name, values in method_metrics.items():
+            if values:
+                results[method][metric_name] = np.mean(values)
+    
+    # Print comparison
+    print("\n" + "="*60)
+    print("Multi-Channel Recall Evaluation")
+    print("="*60)
+    
+    # Print base recaller performance
+    print(f"\n--- Base Recaller Performance ---")
+    header = f"{'Metric':<15}" + "".join([f"{name:>15}" for name in recaller_names])
+    print(header)
+    print("-" * (15 + 15 * len(recaller_names)))
+    for k in [10, 20, 50]:
+        for metric in ['ndcg', 'recall']:
+            key = f"{metric}@{k}"
+            row = f"{key:<15}"
+            for recaller_name in recaller_names:
+                val = results.get(recaller_name, {}).get(key, 0)
+                row += f"{val:>15.4f}"
+            print(row)
+    
+    # Find best base model
+    best_base_ndcg = 0
+    best_base_name = None
+    for recaller_name in recaller_names:
+        ndcg50 = results.get(recaller_name, {}).get("ndcg@50", 0)
+        if ndcg50 > best_base_ndcg:
+            best_base_ndcg = ndcg50
+            best_base_name = recaller_name
+    
+    # Print single select vs multi-channel comparison
+    if results.get("single_select") and results.get("multi_channel"):
+        print(f"\n--- Model Selection vs Multi-Channel vs Avg Score-Weight ---")
+        print(f"{'Metric':<12} {'Single':>12} {'Multi-Ch':>12} {'Avg-SW':>12} {'Best Base':>12} {'Multi Impr':>12} {'Avg Impr':>12}")
+        print("-" * 84)
+        for k in [10, 20, 50]:
+            for metric in ['ndcg', 'recall']:
+                key = f"{metric}@{k}"
+                single = results["single_select"].get(key, 0)
+                multi = results["multi_channel"].get(key, 0)
+                avg_sw = results["avg_score_weight"].get(key, 0)
+                best_base = max(results.get(name, {}).get(key, 0) for name in recaller_names)
+                multi_impr = multi - best_base
+                avg_impr = avg_sw - best_base
+                print(f"{key:<12} {single:>12.4f} {multi:>12.4f} {avg_sw:>12.4f} {best_base:>12.4f} {multi_impr:>+12.4f} {avg_impr:>+12.4f}")
+    
+    return results
+
+
+def tokenize_function(examples, tokenizer, max_length=1536, seq2seq=False):
+    if seq2seq:
+        # For seq2seq: create input-output pairs
+        # Input: user profile text + special prompt
+        # Output: recaller name
+        inputs = []
+        targets = []
+        
+        for text, recaller in zip(examples["text"], examples["best_recaller"]):
+            # Create input-output format for causal LM
+            input_text = text + f"\n\nBest recaller:"
+            target_text = f" {recaller}"
+            
+            inputs.append(input_text)
+            targets.append(input_text + target_text)  # Full sequence for causal LM
+        
+        # Tokenize full sequences
+        model_inputs = tokenizer(targets, padding="max_length", truncation=True, max_length=max_length)
+        
+        # Create labels: copy input_ids and set input portion to -100
+        labels = []
+        input_lengths = []
+        
+        for input_text in inputs:
+            input_tokens = tokenizer(input_text, truncation=True, max_length=max_length)
+            input_lengths.append(len(input_tokens["input_ids"]))
+        
+        for i, length in enumerate(input_lengths):
+            label = model_inputs["input_ids"][i].copy()
+            # Set input portion to -100 (ignored in loss)
+            label[:length] = [-100] * length
+            # Set padding tokens to -100
+            for j, token_id in enumerate(label):
+                if token_id == tokenizer.pad_token_id:
+                    label[j] = -100
+            labels.append(label)
+        
+        model_inputs["labels"] = labels
+        return model_inputs
+    else:
+        # For classification: keep numeric labels
+        tokenized = tokenizer(examples["text"], padding="max_length", truncation=True, max_length=max_length)
+        tokenized["labels"] = examples["labels"]
+        return tokenized
+
+
+def get_paths(args):
+    """Get standardized paths"""
+    model_name = args.model_name.split('/')[-1]
+    base = f"{args.output_dir}/{args.dataset}/{model_name}"
+    recbole_models = args.recbole_models
+    recbole_models.sort()
+    recbole_models = '_'.join(recbole_models)
+    return {
+        "model_name": args.model_name,
+        "sft": f"{base}_pure_{f'seq2seq_' if args.seq2seq else ''}sft_{recbole_models}",
+        "data": f"{base}_pure_sft_data_{recbole_models}_{args.profile_cutoff}",
+        "grpo": f"{base}_pure_grpo_{recbole_models}",
+        "grpo_data": f"{base}_pure_grpo_data_{recbole_models}_{args.profile_cutoff}"
     }
 
 
-def tokenize_function(examples, tokenizer, max_length=1536):
-    """Tokenize the examples for classification"""
-    return tokenizer(examples["text"], padding="max_length", truncation=True, max_length=max_length)
-
-
 def parse_args():
-    ap = argparse.ArgumentParser(description='Pure Text SFT Training for Model Selection')
-    ap.add_argument('--dataset', type=str, default='Amazon_All_Beauty')
-    ap.add_argument('--data_path', type=str, default='./dataset')
-    ap.add_argument('--final_k', type=int, default=50)
-    ap.add_argument('--seed', type=int, default=42)
-    ap.add_argument('--recbole_models', type=str, nargs='+', default=['BPR', 'SASRec', ])
-    ap.add_argument('--checkpoint_dir', type=str, default='./checkpoints')
-    ap.add_argument('--model_name', type=str, default='Qwen/Qwen2.5-0.5B-Instruct')
-    ap.add_argument('--output_dir', type=str, default='GRPO/pure_models')
-    ap.add_argument('--gen_sft_data', action='store_true')
-    ap.add_argument('--do_sft', action='store_true')
-    ap.add_argument('--do_test', action='store_true')
-    ap.add_argument('--use_lora', action='store_true')
-    ap.add_argument('--lora_r', type=int, default=16, help='LoRA rank')
-    ap.add_argument('--lora_alpha', type=int, default=32, help='LoRA alpha')
-    ap.add_argument('--lora_dropout', type=float, default=0.1, help='LoRA dropout')
-    ap.add_argument('--num_train_samples', type=int, default=1000, help='Number of training samples')
-    ap.add_argument('--per_device_train_batch_size', type=int, default=4)
-    ap.add_argument('--gradient_accumulation_steps', type=int, default=1)
-    ap.add_argument('--learning_rate', type=float, default=5e-5)
-    ap.add_argument('--num_train_epochs', type=int, default=3)
-    ap.add_argument('--warmup_steps', type=int, default=100)
-    ap.add_argument('--logging_steps', type=int, default=10)
-    ap.add_argument('--save_steps', type=int, default=500)
-    ap.add_argument('--eval_steps', type=int, default=250)
-    ap.add_argument('--max_length', type=int, default=1536)
-    ap.add_argument('--fp16', action='store_true')
-    ap.add_argument('--bf16', action='store_true')
-    ap.add_argument('--gradient_checkpointing', action='store_true')
-    args = ap.parse_args()
-    return args
+    parser = argparse.ArgumentParser(description='Pure Text SFT Training for Model Selection')
+    # Data
+    parser.add_argument('--dataset', type=str, default='Amazon_All_Beauty')
+    parser.add_argument('--data_path', type=str, default='./dataset')
+    parser.add_argument('--output_dir', type=str, default='GRPO/pure_models')
+    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints')
+    # Model
+    parser.add_argument('--model_name', type=str, default='Qwen/Qwen2.5-0.5B-Instruct')
+    parser.add_argument('--recbole_models', type=str, nargs='+', default=['BPR', 'SASRec', 'LightGCN'])
+    # Tasks
+    parser.add_argument('--gen_sft_data', action='store_true')
+    parser.add_argument('--do_sft', action='store_true')
+    parser.add_argument('--do_test_sft', action='store_true')
+    parser.add_argument('--do_test_grpo', action='store_true')
+    # Training
+    parser.add_argument('--per_device_train_batch_size', type=int, default=4)
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
+    parser.add_argument('--learning_rate', type=float, default=5e-5)
+    parser.add_argument('--num_train_epochs', type=int, default=3)
+    parser.add_argument('--warmup_steps', type=int, default=100)
+    parser.add_argument('--logging_steps', type=int, default=10)
+    parser.add_argument('--save_steps', type=int, default=500)
+    parser.add_argument('--eval_steps', type=int, default=500)
+    parser.add_argument('--max_length', type=int, default=1536)
+    # Other
+    parser.add_argument('--final_k', type=int, default=50)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--bf16', action='store_true')
+    parser.add_argument('--fp16', action='store_true')
+    parser.add_argument('--gradient_checkpointing', action='store_true')
+    parser.add_argument('--padding_side', type=str, default='right', choices=['left', 'right'],
+                       help='Padding side for tokenizer. Use "left" for decoder-only models in classification.')
+    parser.add_argument('--profile_cutoff', type=int, default=20,
+                       help='Cutoff length for user profiles and minimum history length for augmentation.')
+    parser.add_argument('--seq2seq', action='store_true',
+                       help='Use seq2seq model instead of classification model.')
+    # GRPO training
+    parser.add_argument('--do_grpo', action='store_true',
+                       help='Run SofT-GRPO training on top of SFT model.')
+    parser.add_argument('--tau_gumbel', type=float, default=1.0,
+                       help='Gumbel-Softmax temperature for SofT-GRPO.')
+    parser.add_argument('--top_p', type=float, default=0.9,
+                       help='Nucleus sampling threshold for SofT-GRPO.')
+    parser.add_argument('--noise_scale', type=float, default=0.3,
+                       help='Scale factor for Gumbel noise (0.0=no noise, 1.0=full noise).')
+    parser.add_argument('--use_soft_grpo_loss', action='store_true', default=True,
+                       help='Use SofT-GRPO loss (Gumbel reparameterization). Default: True.')
+    parser.add_argument('--use_ppo_loss', action='store_true',
+                       help='Use PPO-style loss instead of SofT-GRPO loss.')
+    parser.add_argument('--epsilon', type=float, default=0.2,
+                       help='PPO clipping coefficient.')
+    parser.add_argument('--beta', type=float, default=0.01,
+                       help='KL penalty weight.')
+    parser.add_argument('--sync_ref_model', action='store_true',
+                       help='Periodically sync ref_model with current model.')
+    parser.add_argument('--ref_model_sync_steps', type=int, default=100,
+                       help='Steps between ref_model syncs.')
+    parser.add_argument('--num_generations', type=int, default=4,
+                       help='Number of generations per prompt (G in GRPO).')
+    parser.add_argument('--grpo_lr', type=float, default=1e-6,
+                       help='Learning rate for GRPO training.')
+    parser.add_argument('--grpo_epochs', type=int, default=3,
+                       help='Number of GRPO training epochs.')
+    
+    return parser.parse_args()
 
 
 def main():
     args = parse_args()
     set_seed(args.seed)
+    paths = get_paths(args)
     
-    model_save_dir = f"{args.output_dir}/{args.dataset}/{args.model_name.split('/')[-1]}"
-    os.makedirs(model_save_dir, exist_ok=True)
-    
-    # Initialize dataset and recallers when needed
-    if args.gen_sft_data or args.do_test:
+
+    grpo_config = GRPOConfig(
+        output_dir=paths["grpo"],
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        per_device_eval_batch_size=args.per_device_train_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        num_train_epochs=args.grpo_epochs,
+        learning_rate=args.grpo_lr,
+        warmup_steps=args.warmup_steps,
+        logging_steps=args.logging_steps,
+        save_steps=args.save_steps,
+        eval_strategy="steps",
+        eval_steps=1000,
+        save_total_limit=3,
+        bf16=args.bf16,
+        # num_generations=2,
+        num_generations=args.num_generations,
+        epsilon=args.epsilon,
+        beta=args.beta,
+        sync_ref_model=args.sync_ref_model,
+        ref_model_sync_steps=args.ref_model_sync_steps,
+        scale_rewards="group",
+        report_to="wandb",
+        run_name=paths["grpo"] + "_" + datetime.now().strftime("%Y%m%d_%H%M%S"),
+        seed=args.seed,
+    )
+    # Initialize components if needed
+    if args.gen_sft_data or args.do_test_sft or args.do_test_grpo:
         inter_dataset = load_dataset(args.dataset, args.data_path, seed=args.seed)
         profile_agent = UserProfileAgent(inter_dataset, args.dataset)
-        cut_off_users = min(len(inter_dataset.train_user_ids), 100000)
         recallers = initialize_recallers(
             model_names=args.recbole_models,
             dataset_name=args.dataset,
@@ -331,243 +834,319 @@ def main():
             num_items=inter_dataset.ds.item_num
         )
     
+    # Generate SFT data
     if args.gen_sft_data:
-        # Generate SFT data
-        assert not args.do_sft and not args.do_test
-        
-        # Get training data
-        user_ids = inter_dataset.train_user_ids[:cut_off_users]
-        histories = inter_dataset.train_histories[:cut_off_users]
-        target_items = inter_dataset.train_target_items[:cut_off_users]
-        
+        # Train dataset
         train_dataset, label2id, id2label = create_sft_dataset(
-            profile_agent=profile_agent,
-            user_ids=user_ids,
-            histories=histories,
-            target_items=target_items,
-            recallers=recallers,
-            final_k=args.final_k,
+            profile_agent, 
+            inter_dataset.train_user_ids[:100000],
+            inter_dataset.train_histories[:100000],
+            inter_dataset.train_target_items[:100000],
+            recallers, args.final_k, args.profile_cutoff
         )
         
-        # Get test data for evaluation
-        test_cut_off = min(len(inter_dataset.test_user_ids), 5000)  # Limit test size
-        test_user_ids = inter_dataset.test_user_ids[:test_cut_off]
-        test_histories = inter_dataset.test_histories[:test_cut_off]
-        test_target_items = inter_dataset.test_target_items[:test_cut_off]
-        
+        # Eval dataset
         eval_dataset, _, _ = create_sft_dataset(
-            profile_agent=profile_agent,
-            user_ids=test_user_ids,
-            histories=test_histories,
-            target_items=test_target_items,
-            recallers=recallers,
-            final_k=args.final_k,
+            profile_agent,
+            inter_dataset.test_user_ids[:1000],
+            inter_dataset.test_histories[:1000],
+            inter_dataset.test_target_items[:1000],
+            recallers, args.final_k, args.profile_cutoff
         )
         
-        # Save datasets and label mappings
-        dataset_path = f'{model_save_dir}_pure_sft_data'
-        if os.path.exists(dataset_path):
-            import shutil
-            shutil.rmtree(dataset_path)
+        # Save
+        os.makedirs(paths["data"], exist_ok=True)
+        train_dataset.save_to_disk(f'{paths["data"]}/train')
+        eval_dataset.save_to_disk(f'{paths["data"]}/eval')
+        with open(f'{paths["data"]}/label_mapping.json', 'w') as f:
+            json.dump({"label2id": label2id, "id2label": id2label}, f, indent=2)
         
-        # Save train dataset
-        train_dataset_path = f'{dataset_path}/train'
-        train_dataset.save_to_disk(train_dataset_path)
-        
-        # Save eval dataset
-        eval_dataset_path = f'{dataset_path}/eval'
-        eval_dataset.save_to_disk(eval_dataset_path)
-        
-        # Save label mappings
-        label_mapping = {
-            "label2id": label2id,
-            "id2label": id2label
-        }
-        with open(f'{dataset_path}/label_mapping.json', 'w') as f:
-            json.dump(label_mapping, f, indent=2)
-        
-        print(f"Train dataset saved to {train_dataset_path}")
-        print(f"Eval dataset saved to {eval_dataset_path}")
-        print(f"Number of training samples: {len(train_dataset)}")
-        print(f"Number of eval samples: {len(eval_dataset)}")
-        print(f"Number of classes: {len(label2id)}")
-        print(f"Classes: {list(label2id.keys())}")
+        print(f"\nSaved: Train={len(train_dataset)}, Eval={len(eval_dataset)}")
         return
     
+    # Train model
     if args.do_sft:
-        model_save_dir = f"{model_save_dir}_pure_sft"
+        # Load data
+        train_dataset = Dataset.load_from_disk(f'{paths["data"]}/train')
+        eval_dataset = Dataset.load_from_disk(f'{paths["data"]}/eval')
+        with open(f'{paths["data"]}/label_mapping.json', 'r') as f:
+            labels = json.load(f)
+            label2id = labels["label2id"]
+            id2label = {int(k): v for k, v in labels["id2label"].items()}
         
-
-        dataset_path = f'{args.output_dir}/{args.dataset}/{args.model_name.split("/")[-1]}_pure_sft_data'
-        # Load train and eval datasets
-        train_dataset = Dataset.load_from_disk(f'{dataset_path}/train')
-        eval_dataset = Dataset.load_from_disk(f'{dataset_path}/eval')
+        # Setup model
+        dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
+        
+        if args.seq2seq:
+            # Try seq2seq first, fallback to causal LM
+            try:
+                model = AutoModelForSeq2SeqLM.from_pretrained(
+                    args.model_name,
+                    torch_dtype=dtype,
+                    device_map="auto"
+                )
+            except:
+                model = AutoModelForCausalLM.from_pretrained(
+                    args.model_name,
+                    torch_dtype=dtype,
+                    device_map="auto"
+                )
+        else:
+            model = AutoModelForSequenceClassification.from_pretrained(
+                args.model_name,
+                num_labels=len(label2id),
+                id2label=id2label,
+                label2id=label2id,
+                torch_dtype=dtype,
+                device_map="auto"
+            )
             
-        # Load label mappings
-        with open(f'{dataset_path}/label_mapping.json', 'r') as f:
-            label_mapping = json.load(f)
-            label2id = label_mapping["label2id"]
-            id2label = {int(k): v for k, v in label_mapping["id2label"].items()}
-            
-        # Load model and tokenizer
-        print("Loading model and tokenizer...")
-        model = AutoModelForSequenceClassification.from_pretrained(
-            args.model_name,
-            num_labels=len(label2id),
-            id2label=id2label,
-            label2id=label2id,
-            torch_dtype=torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32),
-            device_map="auto"
-        )
         tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-            
-        # Add padding token if needed
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-            
-            
-        # Tokenize datasets
-        tokenized_train_dataset = train_dataset.map(
-            partial(tokenize_function, tokenizer=tokenizer, max_length=args.max_length),
-            batched=True,
-            remove_columns=[col for col in train_dataset.column_names if col not in ["labels"]]
-        )
+        tokenizer.pad_token = tokenizer.pad_token or tokenizer.eos_token
+        tokenizer.padding_side = args.padding_side
         
-        tokenized_eval_dataset = eval_dataset.map(
-            partial(tokenize_function, tokenizer=tokenizer, max_length=args.max_length),
-            batched=True,
-            remove_columns=[col for col in eval_dataset.column_names if col not in ["labels"]]
-        )
+        # Tokenize
+        tokenize_fn = partial(tokenize_function, tokenizer=tokenizer, max_length=args.max_length, seq2seq=args.seq2seq)
+        if args.seq2seq:
+            columns_to_remove = ["text", "labels", "best_ndcg", "user_id", "history_len_used"]
+        else:
+            columns_to_remove = ["text", "best_recaller", "best_ndcg", "user_id", "history_len_used"]
+        tokenized_train = train_dataset.map(tokenize_fn, batched=True, 
+                                           remove_columns=columns_to_remove)
+        tokenized_eval = eval_dataset.map(tokenize_fn, batched=True, 
+                                         remove_columns=columns_to_remove)
+        
+        # Train
+        if args.seq2seq:
+            data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
+            compute_metrics_fn = partial(compute_metrics_seq2seq, tokenizer=tokenizer, label2id=label2id)
+        else:
+            data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+            compute_metrics_fn = compute_metrics
             
-        print(f"Total training samples: {len(tokenized_train_dataset)}")
-        print(f"Total evaluation samples: {len(tokenized_eval_dataset)}")
-        print(f"Number of classes: {len(label2id)}")
-        print(f"\nTraining set class distribution:")
-        train_class_counts = defaultdict(int)
-        for item in train_dataset:
-            train_class_counts[item['best_recaller']] += 1
-        for cls, count in sorted(train_class_counts.items()):
-            print(f"  {cls}: {count} ({count/len(train_dataset)*100:.1f}%)")
-            
-            # Set up training arguments
-        training_args = TrainingArguments(
-                output_dir=model_save_dir,
-                save_total_limit=2,
+        trainer = Trainer(
+            model=model,
+            args=TrainingArguments(
+                output_dir=paths["sft"],
+                save_total_limit=1,
                 per_device_train_batch_size=args.per_device_train_batch_size,
                 per_device_eval_batch_size=args.per_device_train_batch_size,
                 gradient_accumulation_steps=args.gradient_accumulation_steps,
                 num_train_epochs=args.num_train_epochs,
-                save_strategy="steps",
-                save_steps=args.save_steps,
+                save_steps=1000,
+                eval_steps=args.eval_steps,
                 logging_steps=args.logging_steps,
-                eval_strategy="steps",  # Changed from evaluation_strategy
-                eval_steps=1500,
-                bf16=args.bf16,
-                fp16=args.fp16 and not args.bf16,
                 learning_rate=args.learning_rate,
                 warmup_steps=args.warmup_steps,
-                seed=args.seed,
+                bf16=args.bf16,
+                fp16=args.fp16 and not args.bf16,
                 gradient_checkpointing=args.gradient_checkpointing,
-                run_name=f"pure_sft_{args.dataset}_lr{args.learning_rate}",
-                report_to="none",
-                metric_for_best_model="loss",
-                greater_is_better=False,
-                remove_unused_columns=True,
-                dataloader_drop_last=True,
-        )
-            
-            # Create data collator for classification
-        data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True)
-            
-        # Create trainer
-        trainer = Trainer(
-            model=model,
-            args=training_args,
-            train_dataset=tokenized_train_dataset,
-            eval_dataset=tokenized_eval_dataset,
+                eval_strategy="epoch",
+                save_strategy="steps",
+                metric_for_best_model="eval_loss",
+                greater_is_better=False,  # loss 越低越好
+                load_best_model_at_end=True,  # 训练结束时加载最佳模型
+                report_to="wandb",
+                run_name=paths["sft"] + "_" + datetime.now().strftime("%Y%m%d_%H%M%S"),
+                seed=args.seed
+            ),
+            train_dataset=tokenized_train,
+            eval_dataset=tokenized_eval,
             tokenizer=tokenizer,
             data_collator=data_collator,
-            compute_metrics=compute_metrics,
+            compute_metrics=compute_metrics_fn,
         )
-            
-            # Train
-        print("Starting training...")
+        
+        print("Training...")
         trainer.train()
-            
-        # Save final model
-        print("Saving final model...")
         trainer.save_model()
-        tokenizer.save_pretrained(model_save_dir)
-        
-        # Update model name for testing
-        model_name = get_last_checkpoint(model_save_dir) or model_save_dir
-        print(f"Using model: {model_name}")
+        tokenizer.save_pretrained(paths["sft"])
     
-    if args.do_test:
-        # Determine model path
-        if args.do_sft:
-            # Use the just-trained model
-            pass
-        else:
-            # Use specified model or find checkpoint
-            model_save_dir_test = f"{args.output_dir}/{args.dataset}/{args.model_name.split('/')[-1]}_pure_sft"
-            if os.path.exists(model_save_dir_test):
-                model_name = get_last_checkpoint(model_save_dir_test) or model_save_dir_test
-            else:
-                model_name = args.model_name
+    # GRPO Training
+    if args.do_grpo:
         
-        print(f"Testing model: {model_name}")
+        print("\n" + "="*60)
+        print("Starting Pure GRPO Training")
+        print("="*60)
         
-        # Load label mappings
-        dataset_path = f'{args.output_dir}/{args.dataset}/{args.model_name.split("/")[-1]}_pure_sft_data'
-        with open(f'{dataset_path}/label_mapping.json', 'r') as f:
-            label_mapping = json.load(f)
-            label2id = label_mapping["label2id"]
-            id2label = {int(k): v for k, v in label_mapping["id2label"].items()}
+        # Initialize recallers if not already done (only needed when running --do_grpo alone)
+        if 'recallers' not in dir() or recallers is None:
+            inter_dataset = load_dataset(args.dataset, args.data_path, seed=args.seed)
+            recallers = initialize_recallers(
+                model_names=args.recbole_models,
+                dataset_name=args.dataset,
+                checkpoint_dir=args.checkpoint_dir,
+                data_path=args.data_path,
+                seed=args.seed,
+                use_latest_checkpoint=True,
+                num_items=inter_dataset.ds.item_num
+            )
         
-        # Load model and tokenizer
+        # Load label mapping
+        with open(f'{paths["data"]}/label_mapping.json', 'r') as f:
+            labels = json.load(f)
+            label2id = labels["label2id"]
+            id2label = {int(k): v for k, v in labels["id2label"].items()}
+        
+        recaller_names = sorted(args.recbole_models)
+        
+        # Load SFT model as starting point
+        sft_model_path = args.model_name
+        # sft_model_path = paths["sft"]
+        # if not os.path.exists(sft_model_path):
+        #     print(f"Error: SFT model not found at {sft_model_path}. Run --do_sft first.")
+        #     return
+        
+        # # Get last checkpoint if needed
+        # if not os.path.exists(os.path.join(sft_model_path, "config.json")):
+        #     last_ckpt = get_last_checkpoint(sft_model_path)
+        #     if last_ckpt:
+        #         sft_model_path = last_ckpt
+        
+        dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
+        
         model = AutoModelForSequenceClassification.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32),
-            device_map="auto"
+            sft_model_path,
+            num_labels=len(label2id),
+            torch_dtype=dtype,
+            device_map="cuda"
         )
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
         
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer = AutoTokenizer.from_pretrained(sft_model_path)
+        tokenizer.pad_token = tokenizer.pad_token or tokenizer.eos_token
+        model.config.pad_token_id = tokenizer.eos_token_id
+        tokenizer.padding_side = "left"
+        
+        # Load SFT dataset directly for GRPO (already contains prompt, history, target_items)
+        grpo_train_dataset = Dataset.load_from_disk(f'{paths["data"]}/train')
+        grpo_eval_dataset_full = Dataset.load_from_disk(f'{paths["data"]}/eval')
+        grpo_eval_dataset = grpo_eval_dataset_full.select(range(min(1000, len(grpo_eval_dataset_full))))
+        print(f"GRPO training dataset: {len(grpo_train_dataset)} samples")
+        print(f"GRPO eval dataset: {len(grpo_eval_dataset)} samples")
+        
+        # Reward function (placeholder - actual rewards computed in trainer)
+        def grpo_reward_fn(prompts, completions, completion_ids, **kwargs):
+            return [0.0] * len(prompts)
+        
+        # GRPO Config
+        
+        # Initialize GRPOTrainer with pure classification mode (like main_soft.py)
+        grpo_trainer = GRPOTrainer(
+            model=model,
+            reward_funcs=grpo_reward_fn,
+            args=grpo_config,
+            train_dataset=grpo_train_dataset,
+            eval_dataset=grpo_eval_dataset,
+            processing_class=tokenizer,
+        )
+        
+        # Create reference model for KL penalty (override the default CausalLM ref_model)
+        if args.beta > 0:
+            ref_model = AutoModelForSequenceClassification.from_pretrained(
+                sft_model_path,
+                num_labels=len(label2id),
+                torch_dtype=dtype,
+                device_map="cuda"
+            )
+            ref_model.config.pad_token_id = tokenizer.eos_token_id
+            ref_model.eval()
+            for param in ref_model.parameters():
+                param.requires_grad = False
+            # Use standard ref_model attribute (enables SyncRefModelCallback)
+            grpo_trainer.ref_model = ref_model
+        
+        # Enable pure classification GRPO mode (similar to use_beta_sampling in main_soft.py)
+        grpo_trainer.use_pure_classification = True
+        grpo_trainer.pure_recallers = recallers
+        grpo_trainer.pure_recaller_names = recaller_names
+        grpo_trainer.pure_final_k = args.final_k
+        grpo_trainer.pure_noise_scale = args.noise_scale
+        # SofT-GRPO loss (default) vs PPO-style loss
+        grpo_trainer.use_soft_grpo_loss = not args.use_ppo_loss
+        # Keep extra columns for reward computation (not removed by _remove_unused_columns)
+        grpo_trainer._signature_columns = ["prompt", "user_id", "history", "target_items"]
+        
+        print("Starting GRPO training...")
+        grpo_trainer.train()
+        grpo_trainer.save_model()
+        tokenizer.save_pretrained(paths["grpo"])
+        print(f"GRPO model saved to {paths['grpo']}")
+    
+    # Test model
+    if args.do_test_sft or args.do_test_grpo:
+        # Load model
+        if args.do_test_sft:
+            model_path = paths["sft"] if os.path.exists(paths["sft"]) else args.model_name
+        elif args.do_test_grpo:
+            model_path = paths["grpo"] if os.path.exists(paths["grpo"]) else args.model_name
+        
+        # Try to get the last checkpoint if main model directory exists
+        if os.path.exists(model_path) and not os.path.exists(os.path.join(model_path, "config.json")):
+            last_checkpoint = get_last_checkpoint(model_path)
+            if last_checkpoint:
+                model_path = last_checkpoint
+                print(f"Loading from last checkpoint: {model_path}")
+            else:
+                print(f"Warning: No checkpoint found in {model_path}")
+        with open(f'{paths["data"]}/label_mapping.json', 'r') as f:
+            labels = json.load(f)
+            id2label = {int(k): v for k, v in labels["id2label"].items()}
+        
+        dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
+        
+        # ///
+        # model_path = args.model_name
+        if args.seq2seq:
+            # Try seq2seq first, fallback to causal LM
+            try:
+                model = AutoModelForSeq2SeqLM.from_pretrained(model_path, torch_dtype=dtype, device_map="auto")
+            except:
+                model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=dtype, device_map="auto")
+        else:
+            model = AutoModelForSequenceClassification.from_pretrained(model_path, torch_dtype=dtype, device_map="auto")
+            
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        tokenizer.pad_token = tokenizer.eos_token
+        model.config.pad_token_id = tokenizer.eos_token_id
+        tokenizer.padding_side = args.padding_side
         
         # Create test dataset
-        cut_off_test_users = min(len(inter_dataset.test_user_ids), 100000)
         test_dataset, _, _ = create_sft_dataset(
-            profile_agent=profile_agent,
-            user_ids=inter_dataset.test_user_ids[:cut_off_test_users],
-            histories=inter_dataset.test_histories[:cut_off_test_users],
-            target_items=inter_dataset.test_target_items[:cut_off_test_users],
-            recallers=recallers,
-            final_k=args.final_k,
+            profile_agent,
+            inter_dataset.test_user_ids[:100000],
+            inter_dataset.test_histories[:100000],
+            inter_dataset.test_target_items[:100000],
+            recallers, args.final_k, args.profile_cutoff
         )
         
-        # No need to apply chat template for classification
-        # The test_dataset already has the correct format
+        # Prepare additional data for recommendation evaluation
+        test_eval_data = {
+            'user_ids': inter_dataset.test_user_ids[:100000],
+            'histories': inter_dataset.test_histories[:100000], 
+            'target_items': inter_dataset.test_target_items[:100000],
+            'profile_cutoff': args.profile_cutoff
+        }
         
         # Evaluate
-        results = evaluate_pure_model(
-            model=model,
-            tokenizer=tokenizer,
-            test_dataset=test_dataset,
-            id2label=id2label,
-            device=model.device
-        )
-        
-        # Save results
-        os.makedirs("results", exist_ok=True)
-        result_file = f"results/pure_results_{args.dataset}.json"
-        with open(result_file, "w") as f:
-            json.dump(results, f, indent=2)
-        print(f"Results saved to {result_file}")
+        if not args.seq2seq:
+            results = evaluate_pure_model(model, tokenizer, test_dataset, id2label, recallers, args.final_k, test_eval_data)
+            
+            # Also run multi-channel recall evaluation
+            # Use recallers.keys() to ensure consistent lowercase naming
+            recaller_names = sorted(recallers.keys())
+            multi_results = evaluate_multi_channel_recall(
+                model, tokenizer, test_dataset, recallers, recaller_names,
+                args.final_k, test_eval_data, use_softmax_weights=True
+            )
+            results["multi_channel_evaluation"] = multi_results
+            
+            # Save results
+            os.makedirs("results", exist_ok=True)
+            with open(f"results/pure_results_{args.dataset}.json", "w") as f:
+                json.dump(results, f, indent=2)
+        else:
+            print("Seq2seq evaluation not implemented yet. Model saved successfully.")
 
 
 if __name__ == "__main__":
-    # Note: --gen_sft_data, --do_sft, and --do_test should be run separately
-    # They cannot be combined in a single run due to GPU resource conflicts
     main()
