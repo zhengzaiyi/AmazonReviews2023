@@ -1,5 +1,6 @@
 import json
 import math
+import os
 from typing import List, Optional, Union
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -32,12 +33,20 @@ class UserProfileAgent:
         self, 
         inter_dataset: InteractionData,
         dataset_name: str,
-        reviews: Dict[str, List[dict]] = None
+        reviews: Dict[str, List[dict]] = None,
+        recaller_metrics_path: str = None,  # Path to recaller metrics JSON file
     ): 
         self.num_items = inter_dataset.ds.item_num
         self.inter_feat, self.item_feat, self.user_feat = {}, {}, {}
         self.iid_field, self.uid_field = inter_dataset.ds.iid_field, inter_dataset.ds.uid_field
         self.dataset_name = dataset_name
+        
+        # Load recaller metrics if provided
+        self.recaller_metrics = None
+        if recaller_metrics_path and os.path.exists(recaller_metrics_path):
+            with open(recaller_metrics_path, 'r') as f:
+                self.recaller_metrics = json.load(f)
+            print(f"Loaded recaller metrics for {len(self.recaller_metrics)} users")
         if inter_dataset.ds.user_feat is not None:
             for row in tqdm(inter_dataset.ds.user_feat.iterrows(), desc='Preprocessing user_feat'):
                 row_dict = row[1].to_dict()
@@ -133,7 +142,8 @@ class UserProfileAgent:
     def _get_item_metadata(self, item_id: int):
         return self.id2meta[str(item_id)]
 
-    def forward(self, user_id: int, history: List[int], cut_off: int = 5, use_meta_data: bool = False):
+    def forward(self, user_id: int, history: List[int], cut_off: int = 5, use_meta_data: bool = False, 
+                include_recaller_metrics: bool = False, available_recallers: List[str] = None):
         if 0 in history:
             history = history[:history.index(0)]
         if len(history) > cut_off:
@@ -146,6 +156,33 @@ class UserProfileAgent:
             {**self.item_feat.get(item_id, {}), **self.inter_feat.get(f'{user_id}_{item_id}', {})} 
             for item_id in history
         ]
+        
+        # Add recaller metrics if enabled and available
+        if include_recaller_metrics and self.recaller_metrics:
+            user_metrics = self.recaller_metrics.get(str(user_id), {})
+            if user_metrics:
+                seq = user_metrics.get("sequence", [])
+                pos_metrics = user_metrics.get("position_metrics", {})
+                # Normalize available_recallers to lowercase for matching
+                valid_recallers = set(r.lower() for r in available_recallers) if available_recallers else None
+                
+                for i, item_id in enumerate(history):
+                    if item_id in seq:
+                        pos = seq.index(item_id)
+                        if str(pos) in pos_metrics:
+                            pm = pos_metrics[str(pos)]
+                            # Find best recaller from available subset
+                            if valid_recallers:
+                                best, best_score = None, -1
+                                for r in valid_recallers:
+                                    if r in pm and isinstance(pm[r], dict):
+                                        score = pm[r].get('ndcg@10', 0)
+                                        if score > best_score:
+                                            best_score, best = score, r
+                                if best:
+                                    user_profile_dict['purchase history'][i]['best_recaller'] = best
+                            else:
+                                user_profile_dict['purchase history'][i]['best_recaller'] = pm.get('best_recaller', 'unknown')
                
         for hist_item in user_profile_dict['purchase history']:
             if 'timestamp' in hist_item.keys():

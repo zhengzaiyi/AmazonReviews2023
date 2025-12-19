@@ -326,21 +326,39 @@ class RecBoleRecaller(BaseRecaller):
                 # Empty sequence with proper shape
                 hist_tensor = torch.tensor([[0]], dtype=torch.long, device=self.config['device'])
             interaction_dict[self.iid_list_field] = hist_tensor
+            
+            # Use truncated length for item_length (must match hist_tensor)
+            actual_len = len(hist_items)
+        else:
+            actual_len = 0
         
         # Add other fields that might be required
         # Length field for sequential models
         if 'item_length' in getattr(self.dataset, 'field2type', {}):
-            if history is not None:
-                hist_len = len(history)
+            # Use actual_len (after truncation) to match the tensor length
+            if self.iid_list_field in self.dataset.field2type:
+                hist_len = actual_len
+            elif history is not None:
+                hist_len = min(len(history), 50)
             else:
-                hist_len = len(self.user2item_list_train.get(user_id, []))
+                hist_len = min(len(self.user2item_list_train.get(user_id, [])), 50)
             interaction_dict['item_length'] = torch.tensor([hist_len], device=self.config['device'])
         
         # Create the Interaction object
         return Interaction(interaction_dict)
 
 
-    def full_sort_predict(self, user_id: int, history: List[int]) -> torch.Tensor:
+    def full_sort_predict(self, user_id: int, history: List[int], 
+                           full_hist: List[int] = None, gt_items: List[int] = None) -> torch.Tensor:
+        """Generate scores for all items.
+        
+        Args:
+            user_id: The user ID
+            history: History items used for prediction (eval_hist)
+            full_hist: All interacted items (optional). If provided along with gt_items,
+                      scores of items in full_hist but not in gt_items will be masked to -inf
+            gt_items: Ground truth items to keep unmasked (optional)
+        """
         interaction = self._create_user_interaction(user_id, history)
         self.model.eval()
         with torch.no_grad():
@@ -354,15 +372,27 @@ class RecBoleRecaller(BaseRecaller):
                 scores_np = scores[0].cpu().numpy().flatten()  # Take first batch element
             else:
                 scores_np = scores.cpu().numpy().flatten()
+            
+            # Mask scores of interacted items (except gt_items) if full_hist is provided
+            if full_hist is not None:
+                gt_set = set(gt_items) if gt_items else set()
+                for item_id in full_hist:
+                    if item_id not in gt_set and 0 <= item_id < len(scores_np):
+                        scores_np[item_id] = float('-inf')
+        
         return scores_np
 
-    def recall(self, user_id: int, topk: int, history: List[int]) -> List[int]:
+    def recall(self, user_id: int, topk: int, history: List[int], 
+                full_hist: List[int] = None, gt_items: List[int] = None) -> List[int]:
         """Generate recommendations for a user
         
         Args:
             user_id: The user ID to generate recommendations for
             topk: Number of recommendations to return
             history: Optional explicit history list. If not provided, will use internal user history
+            full_hist: All interacted items (optional). If provided along with gt_items,
+                      items in full_hist but not in gt_items will be excluded from candidates
+            gt_items: Ground truth items to keep as valid candidates (optional)
             
         Returns:
             List of recommended item IDs
@@ -388,26 +418,30 @@ class RecBoleRecaller(BaseRecaller):
             # Generate scores for all items using proper Interaction object
             scores = self.model.full_sort_predict(interaction)
             
-            # Determine which history to use for filtering
-            if history:
+            # Determine which items to exclude from candidates
+            if full_hist is not None:
+                # Use full_hist for filtering, but keep gt_items as valid candidates
+                gt_set = set(gt_items) if gt_items else set()
+                exclude_set = set(item for item in full_hist if item not in gt_set)
+            elif history:
                 # Use explicitly provided history
-                history_set = set(history)
+                exclude_set = set(history)
             else:
                 # Use internal training history + historical sequence
                 user_train_items = set(self.user2items_train.get(user_id, []))
                 user_history_items = set(self.user2item_list_train.get(user_id, []))
-                history_set = user_train_items.union(user_history_items)
+                exclude_set = user_train_items.union(user_history_items)
             
-            # Convert scores to numpy and filter out history items
+            # Convert scores to numpy and filter out excluded items
             if scores.dim() > 1:
                 scores_np = scores[0].cpu().numpy().flatten()  # Take first batch element
             else:
                 scores_np = scores.cpu().numpy().flatten()
             
-            # Create candidate list excluding history items
+            # Create candidate list excluding items in exclude_set
             candidates = []
             for item_id in range(len(scores_np)):
-                if item_id not in history_set:
+                if item_id not in exclude_set:
                     candidates.append((item_id, scores_np[item_id]))
             
             # Sort by score and return top-k

@@ -37,7 +37,7 @@ export CUDA_VISIBLE_DEVICES=$GPU_ID
 # 基础参数
 profile_cutoff=20
 MODEL_NAME="meta-llama/Llama-3.2-1B-Instruct"
-RECBOLE_MODELS="BPR SASRec LightGCN"
+RECBOLE_MODELS="BPR SASRec FPMC SimpleX LightGCN ItemKNN"
 
 echo "================================================"
 echo "Main Pure V3 Test (No Data Leakage)"
@@ -70,7 +70,7 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-# Step 2: 训练模型
+Step 2: 训练模型
 echo ""
 echo "================================================"
 echo "[Step 2/3] Training SFT model (V3)..."
@@ -86,7 +86,7 @@ python GRPO/main_pure_v2.py \
     --per_device_train_batch_size 4 \
     --gradient_accumulation_steps 1 \
     --learning_rate 1e-5 \
-    --num_train_epochs 7 \
+    --num_train_epochs 3 \
     --warmup_steps 100 \
     --logging_steps 20 \
     --save_steps 500 \
@@ -94,7 +94,6 @@ python GRPO/main_pure_v2.py \
     --max_length 1536 \
     --final_k 50 \
     --seed 42 \
-    --bf16 \
     --gradient_checkpointing \
     --padding_side left \
     --profile_cutoff $profile_cutoff
@@ -119,7 +118,6 @@ python GRPO/main_pure_v2.py \
     --do_test_sft \
     --final_k 50 \
     --seed 42 \
-    --bf16 \
     --padding_side left \
     --profile_cutoff $profile_cutoff
 

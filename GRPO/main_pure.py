@@ -49,7 +49,13 @@ def create_sft_dataset(
     recallers: Dict[str, RecBoleRecaller],
     final_k: int,
     profile_cutoff: int = 20,
-) -> Tuple[Dataset, Dict[str, int], Dict[int, str]]:
+    use_augmentation: bool = True,
+    use_soft_label: bool = False,
+    soft_label_temperature: float = 5.0,
+    user_hint_map: Dict[int, str] = None,  # 用户->eval set最佳recaller的映射
+    use_self_hint: bool = False,  # 是否使用当前样本的best_recaller作为hint (用于eval set)
+    random_history_selection: bool = False,  # 随机选择历史项而非截取最近的
+) -> Tuple[Dataset, Dict[str, int], Dict[int, str], Dict[int, str]]:
     """Create dataset where the model predicts the best recaller class"""
     dataset = []
     metrics = {recaller: defaultdict(list) for recaller in recallers.keys()}
@@ -64,33 +70,60 @@ def create_sft_dataset(
         if 0 in hist:
             hist = hist[:hist.index(0)]
         
-        # Determine history lengths for augmentation
-        history_lengths = [len(hist)]
-        if len(hist) >= MIN_HISTORY_FOR_AUGMENTATION:
-            history_lengths = list(range(profile_cutoff, len(hist), AUGMENTATION_STEP)) + [len(hist)]
+        # Combine history with target as full history (target is the last item)
+        full_hist = hist + [target_items[i]]
         
-        for hist_len in history_lengths:
-            current_hist = hist[:hist_len]
-            
-            # Prepare ground-truth (20% of history + target)
-            n_gt = max(1, min(5, int(len(current_hist) * 0.2)))
-            if len(current_hist) > 1:
-                gt_items = current_hist[-n_gt:] + [target_items[i]]
-                eval_hist = current_hist[:-n_gt]
+        # Fixed history length for eval_hist
+        fixed_hist_len = profile_cutoff
+        # n_gt: number of ground truth items following eval_hist
+        n_gt_ratio = 0.2
+        n_gt = max(1, min(5, int(fixed_hist_len * n_gt_ratio)))
+        
+        # Minimum required length: fixed_hist_len + n_gt
+        min_required_len = fixed_hist_len + n_gt
+        
+        if len(full_hist) < min_required_len:
+            continue
+        
+        # Determine sliding window start positions for augmentation
+        # Each window: eval_hist = full_hist[start:start+fixed_hist_len], gt_items = full_hist[start+fixed_hist_len:start+fixed_hist_len+n_gt]
+        if use_augmentation and len(full_hist) >= MIN_HISTORY_FOR_AUGMENTATION:
+            # Sliding window: different start positions, fixed history length
+            max_start = len(full_hist) - min_required_len
+            start_positions = list(range(0, max_start + 1, AUGMENTATION_STEP))
+            # Always include the last valid position
+            if max_start not in start_positions:
+                start_positions.append(max_start)
+        else:
+            # No augmentation: only use the last window (most recent history)
+            start_positions = [len(full_hist) - min_required_len]
+        
+        for start_pos in start_positions:
+            gt_items = full_hist[start_pos + fixed_hist_len:start_pos + fixed_hist_len + n_gt]
+            if random_history_selection:
+                # 随机选择历史项：从 gt_items 之前的所有项中随机选择 profile_cutoff 个，保持时间顺序
+                available_hist = full_hist[:start_pos + fixed_hist_len]
+                if len(available_hist) >= profile_cutoff:
+                    selected_indices = sorted(np.random.choice(len(available_hist), profile_cutoff, replace=False))
+                    eval_hist = [available_hist[i] for i in selected_indices]
+                else:
+                    eval_hist = available_hist
             else:
-                gt_items = [target_items[i]]
-                eval_hist = current_hist
+                eval_hist = full_hist[start_pos:start_pos + fixed_hist_len]
             
-            if len(eval_hist) < 5:
+            if len(eval_hist) < 5 or len(gt_items) < 1:
                 continue
             
-            # Find best recaller
+            # Find best recaller and collect scores
+            # Mask all interacted items except gt_items for fair evaluation
+            recaller_scores = {}
             best_ndcg, best_recaller = -1, None
             for recaller_name, recaller in recallers.items():
-                items = recaller.recall(uid, final_k, eval_hist)
+                items = recaller.recall(uid, final_k, eval_hist, full_hist=full_hist, gt_items=gt_items)
                 item_ids = [item[0] for item in items] if items else []
                 ndcg = ndcg_at_k(item_ids, gt_items, k=final_k)
                 metrics[recaller_name]["ndcg"].append(ndcg)
+                recaller_scores[recaller_name] = ndcg
                 
                 if ndcg > best_ndcg:
                     best_ndcg = ndcg
@@ -98,9 +131,21 @@ def create_sft_dataset(
             
             # Create sample
             user_profile = profile_agent.forward(uid, eval_hist, cut_off=profile_cutoff)
-            prompt = build_prompt(user_profile, available_models=recaller_names, type='classification')
+            # 确定 hint: use_self_hint 优先使用当前 best_recaller，否则使用 user_hint_map
+            if use_self_hint:
+                hint = best_recaller
+            elif user_hint_map:
+                hint = user_hint_map.get(uid, "")
+            else:
+                hint = ""
             
-            dataset.append({
+            base_prompt = build_prompt(user_profile, available_models=recaller_names, type='classification')
+            if hint:
+                prompt = base_prompt.replace("Your response:", f"\nNote: Based on this user's historical interactions, {hint} has shown the best performance.\nYour response:")
+            else:
+                prompt = base_prompt
+            
+            sample = {
                 "text": prompt,
                 "prompt": prompt,  # For GRPO compatibility
                 "labels": label2id[best_recaller],
@@ -109,8 +154,18 @@ def create_sft_dataset(
                 "user_id": uid,
                 "history": eval_hist,  # For GRPO reward computation
                 "target_items": gt_items,  # For GRPO reward computation
+                "full_hist": full_hist,  # All interacted items for masking during evaluation
                 "history_len_used": len(eval_hist),
-            })
+            }
+            
+            # Compute soft labels if enabled
+            if use_soft_label:
+                scores = torch.tensor([recaller_scores[name] for name in recaller_names])
+                # Temperature-scaled softmax: higher temp = sharper, lower = smoother
+                soft_labels = torch.softmax(scores * soft_label_temperature, dim=0).tolist()
+                sample["soft_labels"] = soft_labels
+            
+            dataset.append(sample)
     
     # Print statistics
     print(f"\nDataset created: {len(dataset)} samples from {len(set(d['user_id'] for d in dataset))} users")
@@ -126,7 +181,12 @@ def create_sft_dataset(
     for model, count in sorted(best_model_counts.items()):
         print(f"{model}: {count} ({count/len(dataset)*100:.1f}%)")
     
-    return Dataset.from_list(dataset), label2id, id2label
+    # 构建 user -> best_recaller 映射 (取每个用户最后一条样本的 best_recaller)
+    user_best_recaller = {}
+    for item in dataset:
+        user_best_recaller[item["user_id"]] = item["best_recaller"]
+    
+    return Dataset.from_list(dataset), label2id, id2label, user_best_recaller
 
 
 def compute_metrics(eval_pred):
@@ -137,6 +197,36 @@ def compute_metrics(eval_pred):
         'f1_macro': f1_score(eval_pred.label_ids, predictions, average='macro'),
         'f1_weighted': f1_score(eval_pred.label_ids, predictions, average='weighted')
     }
+
+
+class SoftLabelTrainer(Trainer):
+    """Trainer that supports soft labels using KL divergence loss instead of hard CE loss"""
+    
+    def __init__(self, *args, use_soft_label=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.use_soft_label = use_soft_label
+    
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if self.use_soft_label and "soft_labels" in inputs:
+            soft_labels = inputs.pop("soft_labels")  # (batch, num_classes)
+            # Keep hard labels for metrics computation
+            _ = inputs.pop("labels", None)
+            
+            outputs = model(**inputs)
+            logits = outputs.logits  # (batch, num_classes)
+            
+            # KL divergence: KL(soft_target || model_output)
+            log_probs = torch.log_softmax(logits, dim=-1)
+            soft_labels_tensor = torch.tensor(soft_labels, device=logits.device, dtype=logits.dtype)
+            
+            # Soft cross entropy: -sum(soft_target * log_prob)
+            loss = -(soft_labels_tensor * log_probs).sum(dim=-1).mean()
+            
+            if return_outputs:
+                return loss, outputs
+            return loss
+        else:
+            return super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
 
 
 def compute_metrics_seq2seq(eval_pred, tokenizer, label2id):
@@ -190,24 +280,13 @@ def compute_metrics_seq2seq(eval_pred, tokenizer, label2id):
     }
 
 
-def evaluate_pure_model(model, tokenizer, test_dataset, id2label, recallers=None, final_k=50, eval_data=None):
+def evaluate_pure_model(model, tokenizer, test_dataset, id2label, recallers=None, final_k=50):
     """Evaluate the pure classification model and generate recommendations"""
     device = model.device
     model.eval()
     
     all_predictions, all_labels = [], []
     recommendation_results = []
-    
-    # Create a mapping from dataset index to original data if eval_data is provided
-    data_mapping = {}
-    if eval_data is not None:
-        # Map user_id to original data
-        for i, uid in enumerate(eval_data['user_ids']):
-            data_mapping[uid] = {
-                'history': eval_data['histories'][i],
-                'target_item': eval_data['target_items'][i],
-                'index': i
-            }
     
     with torch.no_grad():
         for idx, example in enumerate(tqdm(test_dataset, desc="Evaluating")):
@@ -222,77 +301,58 @@ def evaluate_pure_model(model, tokenizer, test_dataset, id2label, recallers=None
             all_labels.append(example["labels"])
             
             # Generate recommendations if recallers are provided
-            if recallers is not None and eval_data is not None:
+            if recallers is not None:
                 predicted_recaller_name = id2label[prediction]
                 true_recaller_name = example["best_recaller"]
                 
-                # Get user data from example
+                # Get data directly from example (already computed in create_sft_dataset)
                 user_id = example["user_id"]
-                history_len = example["history_len_used"]
+                eval_hist = example["history"]
+                gt_items = example["target_items"]
+                full_hist = example.get("full_hist", None)  # For masking interacted items
+                    
+                # Generate recommendations using predicted recaller
+                if predicted_recaller_name in recallers and len(eval_hist) >= 5:
+                    predicted_recaller = recallers[predicted_recaller_name]
+                    pred_items = predicted_recaller.recall(user_id, final_k, eval_hist, full_hist=full_hist, gt_items=gt_items)
+                    pred_item_ids = [item[0] for item in pred_items] if pred_items else []
+                    pred_ndcg = ndcg_at_k(pred_item_ids, gt_items, k=final_k)
+                    pred_recall = recall_at_k(pred_item_ids, gt_items, k=final_k)
+                else:
+                    print(f"Predicted recaller {predicted_recaller_name} not in recallers")
+                    pred_item_ids = []
+                    pred_ndcg = 0.0
+                    pred_recall = 0.0
                 
-                # Get original data for this user
-                if user_id in data_mapping:
-                    orig_data = data_mapping[user_id]
-                    full_history = orig_data['history']
-                    target_item = orig_data['target_item']
-                    
-                    # Remove zeros from history
-                    if 0 in full_history:
-                        full_history = full_history[:full_history.index(0)]
-                    
-                    # Reconstruct evaluation history (similar to create_sft_dataset logic)
-                    # Use 20% of history as ground truth, rest as evaluation history
-                    n_gt = max(1, min(5, int(len(full_history) * 0.2)))
-                    if len(full_history) > 1:
-                        gt_items = full_history[-n_gt:] + [target_item]
-                        eval_hist = full_history[:-n_gt]
-                    else:
-                        gt_items = [target_item]
-                        eval_hist = full_history
-                    
-                    # Ensure we have the right history length
-                    eval_hist = eval_hist[:history_len] if len(eval_hist) > history_len else eval_hist
-                    
-                    # Generate recommendations using predicted recaller
-                    if predicted_recaller_name in recallers and len(eval_hist) >= 5:
-                        predicted_recaller = recallers[predicted_recaller_name]
-                        pred_items = predicted_recaller.recall(user_id, final_k, eval_hist)
-                        pred_item_ids = [item[0] for item in pred_items] if pred_items else []
-    
-    # Calculate metrics
-                        pred_ndcg = ndcg_at_k(pred_item_ids, gt_items, k=final_k)
-                        pred_recall = recall_at_k(pred_item_ids, gt_items, k=final_k)
-                    else:
-                        pred_item_ids = []
-                        pred_ndcg = 0.0
-                        pred_recall = 0.0
-                    
-                    # Generate recommendations using true recaller for comparison
-                    if true_recaller_name in recallers and len(eval_hist) >= 5:
-                        true_recaller = recallers[true_recaller_name]
-                        true_items = true_recaller.recall(user_id, final_k, eval_hist)
-                        true_item_ids = [item[0] for item in true_items] if true_items else []
-                        true_ndcg = ndcg_at_k(true_item_ids, gt_items, k=final_k)
-                        true_recall = recall_at_k(true_item_ids, gt_items, k=final_k)
-                    else:
-                        true_item_ids = []
-                        true_ndcg = 0.0
-                        true_recall = 0.0
-                    
-                    recommendation_results.append({
-                        "user_id": user_id,
-                        "predicted_recaller": predicted_recaller_name,
-                        "true_recaller": true_recaller_name,
-                        "predicted_items": pred_item_ids[:10],  # Top 10 for display
-                        "true_items": true_item_ids[:10],  # Top 10 for display
-                        "ground_truth": gt_items,
-                        "predicted_ndcg": pred_ndcg,
-                        "true_ndcg": true_ndcg,
-                        "predicted_recall": pred_recall,
-                        "true_recall": true_recall,
-                        "correct_prediction": predicted_recaller_name == true_recaller_name,
-                        "history_length": len(eval_hist)
-                    })
+                # Generate recommendations using true recaller for comparison
+                if true_recaller_name in recallers and len(eval_hist) >= 5:
+                    true_recaller = recallers[true_recaller_name]
+                    true_items = true_recaller.recall(user_id, final_k, eval_hist, full_hist=full_hist, gt_items=gt_items)
+                    true_item_ids = [item[0] for item in true_items] if true_items else []
+                    true_ndcg = ndcg_at_k(true_item_ids, gt_items, k=final_k)
+                    true_recall = recall_at_k(true_item_ids, gt_items, k=final_k)
+                else:
+                    print(f"True recaller {true_recaller_name} not in recallers")
+                    true_item_ids = []
+                    true_ndcg = 0.0
+                    true_recall = 0.0
+                
+                recommendation_results.append({
+                    "user_id": user_id,
+                    "predicted_recaller": predicted_recaller_name,
+                    "true_recaller": true_recaller_name,
+                    "predicted_items": pred_item_ids[:10],  # Top 10 for display
+                    "true_items": true_item_ids[:10],  # Top 10 for display
+                    "ground_truth": gt_items,
+                    "eval_hist": eval_hist,  # Store eval_hist for base model evaluation
+                    "full_hist": full_hist,  # All interacted items for masking
+                    "predicted_ndcg": pred_ndcg,
+                    "true_ndcg": true_ndcg,
+                    "predicted_recall": pred_recall,
+                    "true_recall": true_recall,
+                    "correct_prediction": predicted_recaller_name == true_recaller_name,
+                    "history_length": len(eval_hist)
+                })
     
     # Calculate classification metrics
     all_predictions = np.array(all_predictions)
@@ -355,7 +415,7 @@ def evaluate_pure_model(model, tokenizer, test_dataset, id2label, recallers=None
         })
     
     # Evaluate all base recall models for comprehensive comparison
-    if recallers is not None and eval_data is not None and recommendation_results:
+    if recallers is not None and recommendation_results:
         print(f"\n" + "="*60)
         print(f"Base Recall Models Performance on Test Set")
         print(f"="*60)
@@ -376,39 +436,20 @@ def evaluate_pure_model(model, tokenizer, test_dataset, id2label, recallers=None
             
             for res in tqdm(valid_eval_instances, desc=f"Evaluating {recaller_name}", leave=False):
                 user_id = res['user_id']
+                eval_hist = res['eval_hist']  # Use stored eval_hist
+                gt_items = res['ground_truth']  # Use stored ground_truth
+                full_hist = res.get('full_hist', None)  # All interacted items for masking
                 
-                # Get original data for this user
-                if user_id in data_mapping:
-                    orig_data = data_mapping[user_id]
-                    full_history = orig_data['history']
-                    target_item = orig_data['target_item']
-                    
-                    # Remove zeros from history
-                    if 0 in full_history:
-                        full_history = full_history[:full_history.index(0)]
-                    
-                    # Reconstruct evaluation history and ground truth
-                    n_gt = max(1, min(5, int(len(full_history) * 0.2)))
-                    if len(full_history) > 1:
-                        gt_items = full_history[-n_gt:] + [target_item]
-                        eval_hist = full_history[:-n_gt]
-                    else:
-                        gt_items = [target_item]
-                        eval_hist = full_history
-                    
-                    eval_hist = eval_hist[:res['history_length']]
-                    
-                    if len(eval_hist) >= 5:
-                        # Generate recommendations
-                        items = recaller.recall(user_id, final_k, eval_hist)
-                        item_ids = [item[0] for item in items] if items else []
-                        
-                        # Calculate metrics
-                        ndcg = ndcg_at_k(item_ids, gt_items, k=final_k)
-                        recall = recall_at_k(item_ids, gt_items, k=final_k)
-                        
-                        model_ndcgs.append(ndcg)
-                        model_recalls.append(recall)
+                # Generate recommendations
+                items = recaller.recall(user_id, final_k, eval_hist, full_hist=full_hist, gt_items=gt_items)
+                item_ids = [item[0] for item in items] if items else []
+                
+                # Calculate metrics
+                ndcg = ndcg_at_k(item_ids, gt_items, k=final_k)
+                recall = recall_at_k(item_ids, gt_items, k=final_k)
+                
+                model_ndcgs.append(ndcg)
+                model_recalls.append(recall)
             
             if model_ndcgs:
                 avg_ndcg = np.mean(model_ndcgs)
@@ -465,7 +506,9 @@ def multi_channel_recall_average(
     recaller_names: List[str],
     user_id: int,
     history: List[int],
-    total_k: int
+    total_k: int,
+    full_hist: List[int] = None,
+    gt_items: List[int] = None
 ) -> List[Tuple[int, float]]:
     """
     Multi-channel recall using average (uniform) weights.
@@ -478,7 +521,7 @@ def multi_channel_recall_average(
     for name in recaller_names:
         name_lower = name.lower()
         if name_lower in recallers:
-            items = recallers[name_lower].recall(user_id, total_k, history)
+            items = recallers[name_lower].recall(user_id, total_k, history, full_hist=full_hist, gt_items=gt_items)
             for item_id, score in items:
                 candidates[item_id] += score * weight
     
@@ -493,7 +536,6 @@ def evaluate_multi_channel_recall(
     recallers: Dict[str, RecBoleRecaller],
     recaller_names: List[str],
     final_k: int = 50,
-    eval_data=None,
     use_softmax_weights: bool = True
 ):
     """
@@ -514,15 +556,6 @@ def evaluate_multi_channel_recall(
     for recaller_name in recaller_names:
         metrics[recaller_name] = defaultdict(list)
     
-    # Map user_ids to original data
-    data_mapping = {}
-    if eval_data:
-        for i, uid in enumerate(eval_data['user_ids']):
-            data_mapping[uid] = {
-                'history': eval_data['histories'][i],
-                'target_item': eval_data['target_items'][i],
-            }
-    
     with torch.no_grad():
         for idx, example in enumerate(tqdm(test_dataset, desc="Evaluating Multi-Channel")):
             inputs = tokenizer(example["text"], return_tensors="pt", truncation=True, 
@@ -535,31 +568,11 @@ def evaluate_multi_channel_recall(
             # Get softmax weights
             softmax_weights = torch.softmax(logits, dim=-1)
             
-            # Get user data
+            # Get data directly from example (already computed in create_sft_dataset)
             user_id = example.get("user_id", idx)
-            history_len = example.get("history_len_used", None)
-            if user_id not in data_mapping:
-                continue
-            
-            orig_data = data_mapping[user_id]
-            full_history = orig_data['history']
-            target_item = orig_data['target_item']
-            
-            if 0 in full_history:
-                full_history = full_history[:full_history.index(0)]
-            
-            # Ground truth
-            n_gt = max(1, min(5, int(len(full_history) * 0.2)))
-            if len(full_history) > 1:
-                gt_items = full_history[-n_gt:] + [target_item]
-                eval_hist = full_history[:-n_gt]
-            else:
-                gt_items = [target_item]
-                eval_hist = full_history
-            
-            # Apply history_len truncation (consistent with evaluate_pure_model)
-            if history_len is not None:
-                eval_hist = eval_hist[:history_len] if len(eval_hist) > history_len else eval_hist
+            eval_hist = example["history"]
+            gt_items = example["target_items"]
+            full_hist = example.get("full_hist", None)  # For masking interacted items
             
             if len(eval_hist) < 5:
                 continue
@@ -569,7 +582,7 @@ def evaluate_multi_channel_recall(
             pred_recaller = recaller_names[pred_idx]
             # Use original name for lookup (consistent with evaluate_pure_model)
             if pred_recaller in recallers:
-                items = recallers[pred_recaller].recall(user_id, final_k, eval_hist)
+                items = recallers[pred_recaller].recall(user_id, final_k, eval_hist, full_hist=full_hist, gt_items=gt_items)
                 single_rec = [item[0] for item in items]
                 for k in [10, 20, 50]:
                     metrics["single_select"][f"ndcg@{k}"].append(ndcg_at_k(single_rec, gt_items, k))
@@ -579,7 +592,8 @@ def evaluate_multi_channel_recall(
             if use_softmax_weights:
                 candidates = multi_channel_recall_softmax(
                     softmax_weights, recallers, recaller_names,
-                    user_id, eval_hist, final_k
+                    user_id, eval_hist, final_k,
+                    full_hist=full_hist, gt_items=gt_items
                 )
                 multi_rec = [item_id for item_id, _ in candidates]
                 for k in [10, 20, 50]:
@@ -588,7 +602,8 @@ def evaluate_multi_channel_recall(
             
             # 3. Multi-channel recall with average (uniform) score-weight
             avg_candidates = multi_channel_recall_average(
-                recallers, recaller_names, user_id, eval_hist, final_k
+                recallers, recaller_names, user_id, eval_hist, final_k,
+                full_hist=full_hist, gt_items=gt_items
             )
             avg_rec = [item_id for item_id, _ in avg_candidates]
             for k in [10, 20, 50]:
@@ -598,7 +613,7 @@ def evaluate_multi_channel_recall(
             # 4. Evaluate each base recaller
             for recaller_name in recaller_names:
                 if recaller_name in recallers:
-                    items = recallers[recaller_name].recall(user_id, final_k, eval_hist)
+                    items = recallers[recaller_name].recall(user_id, final_k, eval_hist, full_hist=full_hist, gt_items=gt_items)
                     base_rec = [item[0] for item in items] if items else []
                     for k in [10, 20, 50]:
                         metrics[recaller_name][f"ndcg@{k}"].append(ndcg_at_k(base_rec, gt_items, k))
@@ -784,7 +799,14 @@ def parse_args():
     parser.add_argument('--grpo_lr', type=float, default=1e-6,
                        help='Learning rate for GRPO training.')
     parser.add_argument('--grpo_epochs', type=int, default=3,
-                       help='Number of GRPO training epochs.')
+                        help='Number of GRPO training epochs.')
+    # Soft label options
+    parser.add_argument('--use_soft_label', action='store_true',
+                        help='Use soft labels based on score difference instead of hard winner labels.')
+    parser.add_argument('--soft_label_temperature', type=float, default=5.0,
+                        help='Temperature for soft label: higher = sharper distribution, lower = smoother.')
+    parser.add_argument('--random_history_selection', action='store_true',
+                        help='Randomly select profile_cutoff items from history instead of using the most recent ones.')
     
     return parser.parse_args()
 
@@ -808,7 +830,7 @@ def main():
         eval_strategy="steps",
         eval_steps=1000,
         save_total_limit=3,
-        bf16=args.bf16,
+        bf16=True,
         # num_generations=2,
         num_generations=args.num_generations,
         epsilon=args.epsilon,
@@ -836,32 +858,97 @@ def main():
     
     # Generate SFT data
     if args.gen_sft_data:
-        # Train dataset
-        train_dataset, label2id, id2label = create_sft_dataset(
+        # Step 1: 先生成 Eval dataset，获取每个用户的最佳 recaller 作为 hint
+        print("="*60)
+        print("Step 1: Generating Eval dataset to get user hints...")
+        print("="*60)
+        eval_dataset, label2id, id2label, eval_user_hint_map = create_sft_dataset(
+            profile_agent,
+            inter_dataset.eval_user_ids[:1000],
+            inter_dataset.eval_histories[:1000],
+            inter_dataset.eval_target_items[:1000],
+            recallers, args.final_k, args.profile_cutoff,
+            use_augmentation=False,
+            use_soft_label=args.use_soft_label,
+            soft_label_temperature=args.soft_label_temperature,
+            user_hint_map=None,
+            use_self_hint=True,  # eval set 使用自己的 best_recaller 作为 hint
+            random_history_selection=args.random_history_selection,
+        )
+        print(f"Collected hints for {len(eval_user_hint_map)} users from eval set")
+        
+        # Step 2: 使用 eval set 的 hint 生成 Train dataset
+        print("\n" + "="*60)
+        print("Step 2: Generating Train dataset with eval hints...")
+        print("="*60)
+        train_dataset, _, _, _ = create_sft_dataset(
             profile_agent, 
-            inter_dataset.train_user_ids[:100000],
-            inter_dataset.train_histories[:100000],
-            inter_dataset.train_target_items[:100000],
-            recallers, args.final_k, args.profile_cutoff
+            inter_dataset.train_user_ids,
+            inter_dataset.train_histories,
+            inter_dataset.train_target_items,
+            recallers, args.final_k, args.profile_cutoff,
+            use_soft_label=args.use_soft_label,
+            soft_label_temperature=args.soft_label_temperature,
+            user_hint_map=eval_user_hint_map,  # 使用 eval set 的 hint
+            random_history_selection=args.random_history_selection,
         )
         
-        # Eval dataset
-        eval_dataset, _, _ = create_sft_dataset(
+        # Step 3: 使用 eval set 的 hint 生成 Test dataset
+        print("\n" + "="*60)
+        print("Step 3: Generating Test dataset with eval hints...")
+        print("="*60)
+        test_dataset, _, _, _ = create_sft_dataset(
             profile_agent,
-            inter_dataset.test_user_ids[:1000],
-            inter_dataset.test_histories[:1000],
-            inter_dataset.test_target_items[:1000],
-            recallers, args.final_k, args.profile_cutoff
+            inter_dataset.test_user_ids,
+            inter_dataset.test_histories,
+            inter_dataset.test_target_items,
+            recallers, args.final_k, args.profile_cutoff,
+            use_augmentation=False,
+            use_soft_label=args.use_soft_label,
+            soft_label_temperature=args.soft_label_temperature,
+            user_hint_map=eval_user_hint_map,  # 使用 eval set 的 hint
+            random_history_selection=args.random_history_selection,
         )
+        
+        # Statistics: eval set label distribution
+        print("\n" + "="*60)
+        print("Dataset Statistics")
+        print("="*60)
+        
+        eval_label_counts = defaultdict(int)
+        for sample in eval_dataset:
+            eval_label_counts[sample["best_recaller"]] += 1
+        print("\nEval set label distribution:")
+        for label, count in sorted(eval_label_counts.items()):
+            print(f"  {label}: {count} ({count/len(eval_dataset)*100:.1f}%)")
+        
+        # Statistics: eval/test label agreement per user
+        # Build user_id -> label mapping for eval and test
+        eval_user_labels = {sample["user_id"]: sample["best_recaller"] for sample in eval_dataset}
+        test_user_labels = {sample["user_id"]: sample["best_recaller"] for sample in test_dataset}
+        
+        # Find common users
+        common_users = set(eval_user_labels.keys()) & set(test_user_labels.keys())
+        if common_users:
+            same_label_count = sum(1 for uid in common_users if eval_user_labels[uid] == test_user_labels[uid])
+            print(f"\nEval/Test label agreement:")
+            print(f"  Common users: {len(common_users)}")
+            print(f"  Same label: {same_label_count} ({same_label_count/len(common_users)*100:.1f}%)")
+        else:
+            print(f"\nNo common users between eval and test sets")
         
         # Save
         os.makedirs(paths["data"], exist_ok=True)
         train_dataset.save_to_disk(f'{paths["data"]}/train')
         eval_dataset.save_to_disk(f'{paths["data"]}/eval')
+        test_dataset.save_to_disk(f'{paths["data"]}/test')
         with open(f'{paths["data"]}/label_mapping.json', 'w') as f:
             json.dump({"label2id": label2id, "id2label": id2label}, f, indent=2)
+        # 保存 eval set 的 user hint map
+        with open(f'{paths["data"]}/eval_user_hint_map.json', 'w') as f:
+            json.dump({str(k): v for k, v in eval_user_hint_map.items()}, f, indent=2)
         
-        print(f"\nSaved: Train={len(train_dataset)}, Eval={len(eval_dataset)}")
+        print(f"\nSaved: Train={len(train_dataset)}, Eval={len(eval_dataset)}, Test={len(test_dataset)}")
         return
     
     # Train model
@@ -911,6 +998,11 @@ def main():
             columns_to_remove = ["text", "labels", "best_ndcg", "user_id", "history_len_used"]
         else:
             columns_to_remove = ["text", "best_recaller", "best_ndcg", "user_id", "history_len_used"]
+        
+        # Remove soft_labels column if not using soft label training
+        if not args.use_soft_label and "soft_labels" in train_dataset.column_names:
+            columns_to_remove.append("soft_labels")
+        
         tokenized_train = train_dataset.map(tokenize_fn, batched=True, 
                                            remove_columns=columns_to_remove)
         tokenized_eval = eval_dataset.map(tokenize_fn, batched=True, 
@@ -923,8 +1015,10 @@ def main():
         else:
             data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
             compute_metrics_fn = compute_metrics
-            
-        trainer = Trainer(
+        
+        # Use SoftLabelTrainer if soft labels are enabled
+        TrainerClass = SoftLabelTrainer if args.use_soft_label else Trainer
+        trainer = TrainerClass(
             model=model,
             args=TrainingArguments(
                 output_dir=paths["sft"],
@@ -941,13 +1035,13 @@ def main():
                 bf16=args.bf16,
                 fp16=args.fp16 and not args.bf16,
                 gradient_checkpointing=args.gradient_checkpointing,
-                eval_strategy="epoch",
+                eval_strategy="steps",
                 save_strategy="steps",
                 metric_for_best_model="eval_loss",
                 greater_is_better=False,  # loss 越低越好
                 load_best_model_at_end=True,  # 训练结束时加载最佳模型
                 report_to="wandb",
-                run_name=paths["sft"] + "_" + datetime.now().strftime("%Y%m%d_%H%M%S"),
+                run_name=paths["sft"] + ("_soft" if args.use_soft_label else "") + "_" + datetime.now().strftime("%Y%m%d_%H%M%S"),
                 seed=args.seed
             ),
             train_dataset=tokenized_train,
@@ -955,6 +1049,7 @@ def main():
             tokenizer=tokenizer,
             data_collator=data_collator,
             compute_metrics=compute_metrics_fn,
+            **({"use_soft_label": args.use_soft_label} if args.use_soft_label else {}),
         )
         
         print("Training...")
@@ -1059,7 +1154,8 @@ def main():
         grpo_trainer.use_pure_classification = True
         grpo_trainer.pure_recallers = recallers
         grpo_trainer.pure_recaller_names = recaller_names
-        grpo_trainer.pure_final_k = args.final_k
+        # Use k=5 for reward ndcg@k during GRPO (keep other stages unchanged)
+        grpo_trainer.pure_final_k = 5
         grpo_trainer.pure_noise_scale = args.noise_scale
         # SofT-GRPO loss (default) vs PPO-style loss
         grpo_trainer.use_soft_grpo_loss = not args.use_ppo_loss
@@ -1110,40 +1206,73 @@ def main():
         model.config.pad_token_id = tokenizer.eos_token_id
         tokenizer.padding_side = args.padding_side
         
-        # Create test dataset
-        test_dataset, _, _ = create_sft_dataset(
-            profile_agent,
-            inter_dataset.test_user_ids[:100000],
-            inter_dataset.test_histories[:100000],
-            inter_dataset.test_target_items[:100000],
-            recallers, args.final_k, args.profile_cutoff
-        )
-        
-        # Prepare additional data for recommendation evaluation
-        test_eval_data = {
-            'user_ids': inter_dataset.test_user_ids[:100000],
-            'histories': inter_dataset.test_histories[:100000], 
-            'target_items': inter_dataset.test_target_items[:100000],
-            'profile_cutoff': args.profile_cutoff
-        }
+        # Load test dataset from disk (generated in gen_sft_data)
+        if os.path.exists(f'{paths["data"]}/test'):
+            test_dataset = Dataset.load_from_disk(f'{paths["data"]}/test')
+            print(f"Loaded test dataset: {len(test_dataset)} samples")
+        else:
+            test_dataset, _, _, _ = create_sft_dataset(
+                profile_agent,
+                inter_dataset.test_user_ids,
+                inter_dataset.test_histories,
+                inter_dataset.test_target_items,
+                recallers, args.final_k, args.profile_cutoff,
+                use_augmentation=False,
+                random_history_selection=args.random_history_selection,
+            )
         
         # Evaluate
         if not args.seq2seq:
-            results = evaluate_pure_model(model, tokenizer, test_dataset, id2label, recallers, args.final_k, test_eval_data)
+            results = evaluate_pure_model(model, tokenizer, test_dataset, id2label, recallers, args.final_k)
             
             # Also run multi-channel recall evaluation
             # Use recallers.keys() to ensure consistent lowercase naming
             recaller_names = sorted(recallers.keys())
             multi_results = evaluate_multi_channel_recall(
                 model, tokenizer, test_dataset, recallers, recaller_names,
-                args.final_k, test_eval_data, use_softmax_weights=True
+                args.final_k, use_softmax_weights=True
             )
             results["multi_channel_evaluation"] = multi_results
             
-            # Save results
+            # Add configuration info to results
+            recaller_combo = "_".join(sorted(args.recbole_models))
+            results["config"] = {
+                "dataset": args.dataset,
+                "recbole_models": args.recbole_models,
+                "recaller_combo": recaller_combo,
+                "model_name": args.model_name,
+                "final_k": args.final_k,
+                "profile_cutoff": args.profile_cutoff,
+                "test_samples": len(test_dataset),
+                "model_path": model_path,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            
+            # Save results with recaller combo in filename
             os.makedirs("results", exist_ok=True)
-            with open(f"results/pure_results_{args.dataset}.json", "w") as f:
+            result_filename = f"results/pure_results_{args.dataset}_{recaller_combo}.json"
+            with open(result_filename, "w") as f:
                 json.dump(results, f, indent=2)
+            print(f"\nResults saved to: {result_filename}")
+            
+            # Also print a summary for easy comparison
+            print("\n" + "="*60)
+            print("SUMMARY")
+            print("="*60)
+            print(f"Dataset: {args.dataset}")
+            print(f"Recaller Combo: {recaller_combo}")
+            print(f"Classification Accuracy: {results['accuracy']:.4f}")
+            print(f"Classification F1 Macro: {results['f1_macro']:.4f}")
+            if 'avg_predicted_ndcg' in results:
+                print(f"Predicted NDCG@{args.final_k}: {results['avg_predicted_ndcg']:.4f}")
+                print(f"True Best NDCG@{args.final_k}: {results['avg_true_ndcg']:.4f}")
+            if 'avg_predicted_recall' in results:
+                print(f"Predicted Recall@{args.final_k}: {results['avg_predicted_recall']:.4f}")
+                print(f"True Best Recall@{args.final_k}: {results['avg_true_recall']:.4f}")
+            if 'base_model_results' in results:
+                print(f"\nBase Model Performance (NDCG@{args.final_k}):")
+                for name, res in results['base_model_results'].items():
+                    print(f"  {name}: {res['avg_ndcg']:.4f}")
         else:
             print("Seq2seq evaluation not implemented yet. Model saved successfully.")
 

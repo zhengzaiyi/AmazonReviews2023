@@ -37,6 +37,8 @@ profile_cutoff=20
 model_name=meta-llama/Llama-3.2-1B-Instruct
 # model_name=mistralai/Ministral-3-3B-Base-2512
 
+models="SASRec ItemKNN LightGCN"
+
 echo "================================================"
 echo "Dataset: $1"
 echo "GPU: $2"
@@ -52,12 +54,13 @@ python GRPO/main_pure.py \
     --checkpoint_dir ./checkpoints \
     --output_dir GRPO/pure_models \
     --model_name $model_name \
-    --recbole_models BPR SASRec LightGCN\
+    --recbole_models $models\
     --gen_sft_data \
     --final_k 50 \
     --seed 42 \
     --padding_side left \
-    --profile_cutoff $profile_cutoff
+    --random_history_selection \
+    --profile_cutoff $profile_cutoff \
 
 echo "================================================"
 echo "Training pure SFT model..."
@@ -68,7 +71,7 @@ python GRPO/main_pure.py \
     --checkpoint_dir ./checkpoints \
     --output_dir GRPO/pure_models \
     --model_name $model_name \
-    --recbole_models BPR SASRec LightGCN \
+    --recbole_models $models\
     --do_sft \
     --per_device_train_batch_size 4 \
     --gradient_accumulation_steps 1 \
@@ -81,9 +84,9 @@ python GRPO/main_pure.py \
     --max_length 1536 \
     --final_k 50 \
     --seed 42 \
-    --bf16 \
     --gradient_checkpointing \
     --padding_side left \
+    --random_history_selection \
     --profile_cutoff $profile_cutoff \
 
 echo "================================================" 
@@ -95,12 +98,12 @@ python GRPO/main_pure.py \
     --checkpoint_dir ./checkpoints \
     --output_dir GRPO/pure_models \
     --model_name $model_name \
-    --recbole_models BPR SASRec LightGCN \
+    --recbole_models $models\
     --do_test_sft \
     --final_k 50 \
     --seed 42 \
-    --bf16 \
     --padding_side left \
+    --random_history_selection \
     --profile_cutoff $profile_cutoff
 
 echo "================================================"

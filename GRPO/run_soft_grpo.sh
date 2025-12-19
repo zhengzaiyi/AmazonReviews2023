@@ -44,7 +44,7 @@ echo "Recallers: $RECALLERS"
 echo "======================================"
 
 # Common arguments
-COMMON_ARGS="--dataset $DATASET --data_path ./dataset --recbole_models $RECALLERS --seed 42 --bf16"
+COMMON_ARGS="--dataset $DATASET --data_path ./dataset --recbole_models $RECALLERS --seed 42"
 TRAIN_ARGS="--model_name $MODEL_NAME --per_device_train_batch_size $BATCH_SIZE --gradient_accumulation_steps $GRAD_ACCUM"
 
 # SofT-GRPO specific args

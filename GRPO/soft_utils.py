@@ -167,7 +167,9 @@ def multi_channel_recall_softmax(
     recaller_names: List[str],
     user_id: int,
     history: List[int],
-    total_k: int
+    total_k: int,
+    full_hist: List[int] = None,
+    gt_items: List[int] = None
 ) -> List[Tuple[int, float]]:
     """
     Multi-channel recall using softmax weights from classification.
@@ -179,6 +181,9 @@ def multi_channel_recall_softmax(
         user_id: User ID
         history: User history
         total_k: Number of items to return
+        full_hist: All interacted items (optional). If provided along with gt_items,
+                  items in full_hist but not in gt_items will be excluded
+        gt_items: Ground truth items to keep as valid candidates (optional)
         
     Returns:
         List of (item_id, score) sorted by weighted score
@@ -190,7 +195,7 @@ def multi_channel_recall_softmax(
         name_lower = name.lower()
         
         if name_lower in recallers:
-            items = recallers[name_lower].recall(user_id, total_k, history)
+            items = recallers[name_lower].recall(user_id, total_k, history, full_hist=full_hist, gt_items=gt_items)
             for item_id, score in items:
                 candidates[item_id] += score * weight
     

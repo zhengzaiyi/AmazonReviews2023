@@ -149,6 +149,8 @@ def create_sft_dataset_v3(
     id2label = {i: name for name, i in label2id.items()}
     
     all_samples = []
+    # Collect per-recaller metrics on the label split (recall_hist vs test_gt)
+    base_metrics = {name: {"ndcg": [], "recall": []} for name in recaller_names}
     
     for i, uid in enumerate(tqdm(user_ids, desc="Building samples")):
         hist = _clean_history(histories[i])
@@ -175,7 +177,11 @@ def create_sft_dataset_v3(
         hint_best, _, _ = _find_best_recaller(uid, recallers, inner_recall, inner_gt, final_k)
         
         # 2. Label: 用 recall_hist 召回，用 test_gt 评估 (真正的 ground truth)
-        label_best, _, _ = _find_best_recaller(uid, recallers, recall_hist, test_gt, final_k)
+        label_best, _, label_scores = _find_best_recaller(uid, recallers, recall_hist, test_gt, final_k)
+        # 聚合各个 base recaller 的指标
+        for name, score_dict in label_scores.items():
+            base_metrics[name]["ndcg"].append(score_dict["ndcg"])
+            base_metrics[name]["recall"].append(score_dict["recall"])
         
         # 构建 prompt（基于 recall_hist，包含 hint）
         profile = profile_agent.forward(uid, recall_hist, cut_off=profile_cutoff)
@@ -212,6 +218,16 @@ def create_sft_dataset_v3(
     print(f"\nLabel Distribution:")
     for m, c in sorted(dist.items()):
         print(f"  {m}: {c} ({c/n*100:.1f}%)")
+    
+    # 打印各个 base recaller 在 label split 上的平均指标
+    print(f"\nBase Recaller Evaluation (recall_hist -> test_gt):")
+    for name in recaller_names:
+        ndcg_vals = base_metrics[name]["ndcg"]
+        recall_vals = base_metrics[name]["recall"]
+        if ndcg_vals:
+            print(f"  {name}: NDCG@{final_k}={np.mean(ndcg_vals):.4f}, Recall@{final_k}={np.mean(recall_vals):.4f} (n={len(ndcg_vals)})")
+        else:
+            print(f"  {name}: no valid samples")
     
     return (
         Dataset.from_list(train_samples),
@@ -1068,12 +1084,51 @@ def main():
             )
             results["multi_channel_evaluation"] = multi_results
             
-            # Save results
+            # Add configuration info to results
+            recaller_combo = "_".join(sorted(args.recbole_models))
+            results["config"] = {
+                "dataset": args.dataset,
+                "recbole_models": args.recbole_models,
+                "recaller_combo": recaller_combo,
+                "model_name": args.model_name,
+                "final_k": args.final_k,
+                "profile_cutoff": args.profile_cutoff,
+                "test_samples": len(test_dataset),
+                "model_path": model_path,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                # V2 specific options
+                "filter_close_recallers": args.filter_close_recallers,
+                "close_threshold": args.close_threshold,
+                "max_ground_truth": args.max_ground_truth,
+                "use_soft_labels": args.use_soft_labels,
+                "label_smoothing": args.label_smoothing,
+            }
+            
+            # Save results with recaller combo in filename
             os.makedirs("results", exist_ok=True)
-            result_filename = f"results/pure_v3_results_{args.dataset}.json"
+            result_filename = f"results/pure_v2_results_{args.dataset}_{recaller_combo}.json"
             with open(result_filename, "w") as f:
                 json.dump(results, f, indent=2)
             print(f"\nResults saved to: {result_filename}")
+            
+            # Print summary for easy comparison
+            print("\n" + "="*60)
+            print("SUMMARY")
+            print("="*60)
+            print(f"Dataset: {args.dataset}")
+            print(f"Recaller Combo: {recaller_combo}")
+            print(f"Classification Accuracy: {results['accuracy']:.4f}")
+            print(f"Classification F1 Macro: {results['f1_macro']:.4f}")
+            if 'avg_predicted_ndcg' in results:
+                print(f"Predicted NDCG@{args.final_k}: {results['avg_predicted_ndcg']:.4f}")
+                print(f"True Best NDCG@{args.final_k}: {results['avg_true_ndcg']:.4f}")
+            if 'avg_predicted_recall' in results:
+                print(f"Predicted Recall@{args.final_k}: {results['avg_predicted_recall']:.4f}")
+                print(f"True Best Recall@{args.final_k}: {results['avg_true_recall']:.4f}")
+            if 'base_model_results' in results:
+                print(f"\nBase Model Performance (NDCG@{args.final_k}):")
+                for name, res in results['base_model_results'].items():
+                    print(f"  {name}: {res['avg_ndcg']:.4f}")
         else:
             print("Seq2seq evaluation not implemented yet. Model saved successfully.")
 

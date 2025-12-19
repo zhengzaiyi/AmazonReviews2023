@@ -1,45 +1,52 @@
-from datasets import load_dataset
-from trl import GRPOConfig, GRPOTrainer
-dataset = load_dataset("trl-lib/ultrafeedback-prompt", split="train")
-# Dummy reward function for demonstration purposes
-def reward_num_unique_letters(completions, **kwargs):
-    """Reward function that rewards completions with more unique letters."""
-    completion_contents = [completion[0]["content"] for completion in completions]
-    return [float(len(set(content))) for content in completion_contents]
-training_args = GRPOConfig(
-        output_dir=f"_vanilla",
-        adam_beta1=0.9,
-        adam_beta2=0.99,
-        beta=0.001,
-        per_device_train_batch_size=2,
-        per_device_eval_batch_size=2,
-        num_train_epochs=2,
-        # eval_strategy="steps",
-        # eval_steps=100,
-        save_strategy="steps",
-        save_steps=200,
-        logging_steps=10,
-        bf16=True,
-        gradient_accumulation_steps=3,
-        learning_rate=1e-6,
-        optim="paged_adamw_8bit",
-        lr_scheduler_type="constant",
-        use_vllm=True,
-        vllm_mode="colocate",
-        vllm_gpu_memory_utilization=0.5,
-        vllm_tensor_parallel_size=2,
-        seed=3407,
-        max_prompt_length=2048,
-        max_completion_length=1024,
-        num_generations=8,
-        gradient_checkpointing=True,
-        run_name="vanilla_" + f"_lr{1e-6}_kl{1e-3}",
-        report_to = "wandb"
-    )
-trainer = GRPOTrainer(
-    model="Qwen/Qwen2-0.5B-Instruct",
-    reward_funcs=reward_num_unique_letters,
-    args=training_args,
-    train_dataset=dataset,
+from transformers import AutoTokenizer, pipeline
+
+model_id = "meta-llama/Llama-3.2-1B-Instruct"  # 用指令微调版
+
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+pipe = pipeline(
+    "text-generation",
+    model=model_id,
+    tokenizer=tokenizer,
+    device_map="auto",         # 有多卡/单卡会自动放
+    torch_dtype="auto"
 )
-trainer.train()
+
+def chat_once(messages):
+    """
+    messages: 形如 [
+      {"role": "system", "content": "..."},
+      {"role": "user", "content": "..."},
+      {"role": "assistant", "content": "..."},
+      ...
+    ]
+    """
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,  # 自动加上 assistant 的开头标记
+    )
+    out = pipe(
+        prompt,
+        max_new_tokens=256,
+        do_sample=True,
+        temperature=0.7,
+        top_p=0.9,
+    )[0]["generated_text"]
+
+    # 简单做法：把原始 prompt 切掉，只保留新生成的部分
+    reply = out[len(prompt):]
+    return reply.strip()
+
+history = [
+    {"role": "system", "content": "You are a helpful AI assistant that replies in Chinese."}
+]
+
+while True:
+    user_input = input("你：")
+    if user_input.strip().lower() in ["quit", "exit"]:
+        break
+
+    history.append({"role": "user", "content": user_input})
+    reply = chat_once(history)
+    print("模型：", reply)
+    history.append({"role": "assistant", "content": reply})

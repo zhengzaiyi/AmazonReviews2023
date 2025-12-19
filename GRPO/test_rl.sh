@@ -18,6 +18,5 @@ python GRPO/main_pure.py \
     --do_test_grpo \
     --final_k 50 \
     --seed 42 \
-    --bf16 \
     --padding_side left \
     --profile_cutoff 20
