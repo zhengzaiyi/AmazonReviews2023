@@ -19,7 +19,8 @@ export MASTER_PORT=12366
 
 export TORCH_COMPILE_DISABLE=1
 export TORCHDYNAMO_DISABLE=1
-export WANDB_MODE=disabled
+export WANDB_PROJECT="pure-sft"
+# export WANDB_MODE=disabled
 
 # Usage: ./pure_sft.sh <dataset_name> <gpu_id>
 # Example: ./pure_sft.sh Amazon_All_Beauty 0
@@ -39,13 +40,13 @@ final_k=5
 # model_name=microsoft/deberta-v3-base
 # model_name=mistralai/Ministral-3-3B-Base-2512
 
-models="Pop SimpleX LightGCN"
+models="SASRec ItemKNN LightGCN"
 
-# echo "================================================"
-# echo "Dataset: $1"
-# echo "GPU: $2"
-# echo "Model: $model_name"
-# echo "================================================"
+echo "================================================"
+echo "Dataset: $1"
+echo "GPU: $2"
+echo "Model: $model_name"
+echo "================================================"
 
 echo "================================================"
 echo "Generating pure SFT data..."
@@ -65,6 +66,7 @@ python GRPO/models/main_pure.py \
     --profile_cutoff $profile_cutoff \
     --gen_sft_train \
     --gen_sft_eval \
+    --autoregressive \
 
 echo "================================================"
 echo "Training pure SFT model..."
@@ -83,8 +85,8 @@ python GRPO/models/main_pure.py \
     --num_train_epochs 3 \
     --warmup_steps 100 \
     --logging_steps 20 \
-    --save_steps 500 \
-    --eval_steps 500 \
+    --save_steps 1000 \
+    --eval_steps 1000 \
     --max_length 1536 \
     --final_k $final_k \
     --seed 42 \
@@ -92,6 +94,7 @@ python GRPO/models/main_pure.py \
     --padding_side left \
     --random_history_selection \
     --profile_cutoff $profile_cutoff \
+    --autoregressive \
 
 echo "================================================" 
 echo "Testing pure SFT model..."
@@ -108,7 +111,10 @@ python GRPO/models/main_pure.py \
     --seed 42 \
     --padding_side left \
     --random_history_selection \
-    --profile_cutoff $profile_cutoff
+    --profile_cutoff $profile_cutoff \
+    --merge_method top_k \
+    --autoregressive \
+
 
 echo "================================================"
 echo "Pure SFT training completed!"

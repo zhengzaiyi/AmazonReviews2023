@@ -1,14 +1,16 @@
 #!/bin/bash
 
 # =============================================================================
-# test_baseline_pairs.sh - 测试所有recallers两两组合的baseline性能
+# test_baseline_pairs.sh - 测试所有recallers组合的baseline性能
 # =============================================================================
 # 
-# 用法: ./test_baseline_pairs.sh <dataset> <gpu_id>
+# 用法: ./test_baseline_pairs.sh <dataset> <gpu_id> [combo_size]
 #
 # 示例:
-#   ./test_baseline_pairs.sh ml-1m 0
-#   ./test_baseline_pairs.sh Amazon_All_Beauty 1
+#   ./test_baseline_pairs.sh ml-1m 0          # 默认3个model的组合
+#   ./test_baseline_pairs.sh ml-1m 0 3        # 3个model的组合
+#   ./test_baseline_pairs.sh ml-1m 0 2        # 2个model的组合(pair)
+#   ./test_baseline_pairs.sh Amazon_All_Beauty 1 4  # 4个model的组合
 #
 # =============================================================================
 
@@ -19,16 +21,20 @@ export WANDB_MODE=disabled
 
 # 检查参数
 if [ -z "$1" ] || [ -z "$2" ]; then
-    echo "Usage: $0 <dataset> <gpu_id>"
+    echo "Usage: $0 <dataset> <gpu_id> [combo_size]"
     echo ""
     echo "Examples:"
-    echo "  $0 ml-1m 0"
-    echo "  $0 Amazon_All_Beauty 1"
+    echo "  $0 ml-1m 0          # 默认3个model的组合"
+    echo "  $0 ml-1m 0 3        # 3个model的组合"
+    echo "  $0 ml-1m 0 2        # 2个model的组合(pair)"
+    echo "  $0 Amazon_All_Beauty 1 4  # 4个model的组合"
     exit 1
 fi
 
 DATASET=$1
 GPU_ID=$2
+COMBO_SIZE=${3:-3}  # 默认组合大小为3
+SCORE_NORM=${4:-minmax}
 
 cd /data/sjc4fq/ColdRec/AmazonReviews2023
 export CUDA_VISIBLE_DEVICES=$GPU_ID
@@ -37,52 +43,107 @@ export CUDA_VISIBLE_DEVICES=$GPU_ID
 profile_cutoff=20
 final_k=50
 seed=42
-
+score_norm=$SCORE_NORM
 # 定义所有可用的recallers
 ALL_RECALLERS=("BPR" "SASRec" "ItemKNN" "LightGCN" "Pop" "SimpleX")
+TOTAL_RECALLERS=${#ALL_RECALLERS[@]}
 
-# 生成所有两两组合
+# 验证组合大小
+if [ $COMBO_SIZE -lt 1 ] || [ $COMBO_SIZE -gt $TOTAL_RECALLERS ]; then
+    echo "Error: combo_size must be between 1 and $TOTAL_RECALLERS"
+    exit 1
+fi
+
 echo "================================================"
-echo "Testing All Recaller Pairs Baseline Performance"
+echo "Testing All Recaller Combinations Baseline Performance"
 echo "================================================"
 echo "Dataset: $DATASET"
 echo "GPU: $GPU_ID"
+echo "Combo size: $COMBO_SIZE"
 echo "Available recallers: ${ALL_RECALLERS[@]}"
+echo "Total recallers: $TOTAL_RECALLERS"
 echo "================================================"
 
 # 创建结果目录
 mkdir -p results
 
-# 生成所有两两组合
-pairs=()
-for i in "${!ALL_RECALLERS[@]}"; do
-    for j in "${!ALL_RECALLERS[@]}"; do
-        if [ $i -lt $j ]; then
-            pairs+=("${ALL_RECALLERS[$i]} ${ALL_RECALLERS[$j]}")
+# 递归函数生成所有组合 C(n, k)
+# 参数: start_idx, remaining_k, current_combo_str
+generate_combinations() {
+    local start_idx=$1
+    local remaining_k=$2
+    local current_combo_str="$3"
+    
+    if [ $remaining_k -eq 0 ]; then
+        # 组合完成，添加到全局数组
+        combos+=("$current_combo_str")
+        return
+    fi
+    
+    local max_idx=$((TOTAL_RECALLERS - remaining_k))
+    for ((i=$start_idx; i<=$max_idx; i++)); do
+        if [ -z "$current_combo_str" ]; then
+            local new_combo_str="${ALL_RECALLERS[$i]}"
+        else
+            local new_combo_str="$current_combo_str ${ALL_RECALLERS[$i]}"
         fi
+        generate_combinations $((i+1)) $((remaining_k-1)) "$new_combo_str"
     done
-done
+}
 
-echo "Total pairs to test: ${#pairs[@]}"
+# 生成所有组合
+combos=()
+if [ $COMBO_SIZE -eq 1 ]; then
+    # 特殊情况：单个model
+    for recaller in "${ALL_RECALLERS[@]}"; do
+        combos+=("$recaller")
+    done
+elif [ $COMBO_SIZE -eq 2 ]; then
+    # 特殊情况：两两组合（保持原逻辑）
+    for i in "${!ALL_RECALLERS[@]}"; do
+        for j in "${!ALL_RECALLERS[@]}"; do
+            if [ $i -lt $j ]; then
+                combos+=("${ALL_RECALLERS[$i]} ${ALL_RECALLERS[$j]}")
+            fi
+        done
+    done
+elif [ $COMBO_SIZE -eq 3 ]; then
+    # 特殊情况：三个组合（三层循环，性能更好）
+    for i in "${!ALL_RECALLERS[@]}"; do
+        for j in "${!ALL_RECALLERS[@]}"; do
+            for k in "${!ALL_RECALLERS[@]}"; do
+                if [ $i -lt $j ] && [ $j -lt $k ]; then
+                    combos+=("${ALL_RECALLERS[$i]} ${ALL_RECALLERS[$j]} ${ALL_RECALLERS[$k]}")
+                fi
+            done
+        done
+    done
+else
+    # 通用情况：使用递归函数（支持任意大小的组合）
+    generate_combinations 0 $COMBO_SIZE ""
+fi
+
+echo "Total combinations to test: ${#combos[@]}"
 echo ""
 
 # 汇总文件
-SUMMARY_FILE="results/baseline_pairs_summary_${DATASET}_$(date +%Y%m%d_%H%M%S).txt"
-echo "Baseline Performance for Recaller Pairs - $DATASET" > $SUMMARY_FILE
+SUMMARY_FILE="results/baseline_combos_summary_${DATASET}_size${COMBO_SIZE}_$(date +%Y%m%d_%H%M%S).txt"
+echo "Baseline Performance for Recaller Combinations (size=$COMBO_SIZE) - $DATASET" > $SUMMARY_FILE
 echo "Started at: $(date)" >> $SUMMARY_FILE
-echo "Total pairs: ${#pairs[@]}" >> $SUMMARY_FILE
+echo "Total combinations: ${#combos[@]}" >> $SUMMARY_FILE
+echo "Combo size: $COMBO_SIZE" >> $SUMMARY_FILE
 echo "================================================" >> $SUMMARY_FILE
 echo "" >> $SUMMARY_FILE
 
 # 测试每个组合
-pair_num=0
-for combo in "${pairs[@]}"; do
-    pair_num=$((pair_num + 1))
+combo_num=0
+for combo in "${combos[@]}"; do
+    combo_num=$((combo_num + 1))
     combo_name=$(echo "$combo" | tr ' ' '_')
     
     echo ""
     echo "================================================"
-    echo "[$pair_num/${#pairs[@]}] Testing: $combo"
+    echo "[$combo_num/${#combos[@]}] Testing: $combo"
     echo "================================================"
     
     # 运行baseline测试
@@ -98,7 +159,9 @@ for combo in "${pairs[@]}"; do
         --seed $seed \
         --padding_side left \
         --random_history_selection \
-        --profile_cutoff $profile_cutoff
+        --profile_cutoff $profile_cutoff \
+        --merge_method top_k \
+        --score_norm $score_norm
     
     # 检查结果文件是否存在
     result_file="results/baseline_results_${DATASET}_${combo_name}.json"
@@ -122,7 +185,7 @@ done
 
 echo ""
 echo "================================================"
-echo "All pairs tested!"
+echo "All combinations tested!"
 echo "================================================"
 echo "Summary saved to: $SUMMARY_FILE"
 echo ""

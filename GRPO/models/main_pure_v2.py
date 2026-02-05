@@ -47,9 +47,9 @@ from GRPO.core.data import load_dataset
 from GRPO.models.main import initialize_recallers
 from GRPO.core.recallers import RecBoleRecaller
 from GRPO.core.utils import set_seed, build_prompt, ndcg_at_k, recall_at_k
-from GRPO.models.soft_utils import multi_channel_recall_softmax, compute_ndcg_at_k as soft_ndcg
+from GRPO.models.soft_utils import multi_channel_recall_score, compute_ndcg_at_k as soft_ndcg
 from GRPO.trainers.trl_trainer import GRPOTrainer
-from GRPO.models.soft_utils import multi_channel_recall_softmax, compute_ndcg_at_k
+from GRPO.models.soft_utils import multi_channel_recall_score, compute_ndcg_at_k
 from trl import GRPOConfig
 
 
@@ -499,7 +499,7 @@ def evaluate_multi_channel_recall(
             
             # 2. Multi-channel recall with softmax weights
             if use_softmax_weights:
-                candidates = multi_channel_recall_softmax(
+                candidates = multi_channel_recall_score(
                     softmax_weights, recallers, recaller_names, uid, recall_hist, final_k
                 )
                 multi_rec = [item_id for item_id, _ in candidates]

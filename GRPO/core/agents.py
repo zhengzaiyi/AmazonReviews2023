@@ -191,7 +191,7 @@ class UserProfileAgent:
                 try:
                     if ts > 1e12:  # Milliseconds (e.g., 1609459200000)
                         ts = ts / 1000
-                    if ts > 1e9:  # Reasonable Unix timestamp (after 2001)
+                    if ts > 86400:  # Reasonable Unix timestamp (after 2001)
                         hist_item['timestamp'] = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
                     else:
                         # Invalid timestamp (e.g., 0 -> 1970), mark as unknown
@@ -200,8 +200,33 @@ class UserProfileAgent:
                     # Invalid timestamp, mark as unknown
                     hist_item['timestamp'] = 'unknown'
         
+        # Convert numpy types to Python native types for yaml serialization
+        def convert_numpy(obj):
+            if isinstance(obj, dict):
+                return {k: convert_numpy(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_numpy(v) for v in obj]
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, (np.integer, np.int64, np.int32)):
+                return int(obj)
+            elif isinstance(obj, (np.floating, np.float64, np.float32)):
+                return float(obj)
+            elif isinstance(obj, np.bool_):
+                return bool(obj)
+            elif isinstance(obj, (np.str_, np.bytes_)):
+                return str(obj)
+            return obj
+        
+        user_profile_dict = convert_numpy(user_profile_dict)
+        
+        # Convert purchase history list to numbered dict for better readability
+        user_profile_dict['purchase history'] = {
+            str(i+1): item for i, item in enumerate(user_profile_dict['purchase history'])
+        }
+        
         # Use yaml.dump with safe_dump behavior and proper unicode handling
-        return yaml.dump(user_profile_dict, default_flow_style=False, allow_unicode=True, default_style=None)
+        return yaml.dump(user_profile_dict, default_flow_style=False, allow_unicode=True, default_style=None, sort_keys=False)
 
 
 class LLMRouterAgent:

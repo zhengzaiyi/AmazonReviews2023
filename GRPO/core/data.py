@@ -4,6 +4,10 @@ import numpy as np
 import torch
 import os
 import copy
+import warnings
+# Suppress pandas FutureWarning from recbole
+warnings.filterwarnings('ignore', category=FutureWarning, message='.*A value is trying to be set on a copy of a DataFrame.*')
+
 from GRPO.core.constant import dataset2item_feat_fields, dataset2user_feat_fields, dataset2inter_feat_fields
 
 try:
@@ -32,7 +36,7 @@ class InteractionData:
     test_histories: List[List[int]]
     test_target_items: List[int]
 
-def filter_dataset_one_per_user(
+def keep_longest_per_user(
     dataloader,
     dataset: SequentialDataset,
     config: Config = None,
@@ -85,9 +89,13 @@ def filter_dataset_one_per_user(
     print("sum of keep_mask", sum(keep_mask))
     # 直接返回过滤后的三元组
     filtered_inter = inter[keep_mask]
-    user_ids = filtered_inter[uid_field]
-    item_id_lists = filtered_inter[iid_list_field]
-    item_ids = filtered_inter[iid_field]
+    user_ids = filtered_inter[uid_field].tolist()
+    item_id_lists = filtered_inter[iid_list_field].tolist()
+    for i in range(len(item_id_lists)):
+        if 0 in item_id_lists[i]:
+            index_0 = item_id_lists[i].index(0)
+            item_id_lists[i] = item_id_lists[i][:index_0]
+    item_ids = filtered_inter[iid_field].tolist()
     
     return user_ids, item_id_lists, item_ids
 
@@ -154,16 +162,41 @@ def get_base_config_dict(
         del config_dict['val_interval']
     return config_dict
 
+def get_mask(time_order: bool, rate: List[float], length: int):
+    if sum(rate) != 1.0:
+        raise ValueError(f"Sum of rates must be 1.0, but got {sum(rate)}")
+    
+    train_rate, eval_rate, test_rate = rate
+    indices = np.arange(length)
+    if not time_order:
+        indices = np.random.permutation(indices)
+    test_size = max(1, int(length * test_rate))
+    eval_size = max(1, int(length * eval_rate))
+    train_gt_size = min(test_size, eval_size)
+    train_size = length - test_size - eval_size - train_gt_size
+    
+    train_gt_start = train_size
+    eval_start = train_gt_start + train_gt_size
+    test_start = eval_start + eval_size
+    return {
+        'train': indices[:train_size],
+        'train_gt': indices[train_gt_start:train_gt_start+train_gt_size],
+        'eval': indices[eval_start:eval_start+eval_size],
+        'test': indices[test_start:test_start+test_size],
+    }
+    
 def load_dataset(
     dataset: str, 
     data_path: str, 
     seed: int = 42, 
-    filter_train: bool = False,
-    filter_eval: bool = False,
-    filter_test: bool = False,
     train_ratio: float = 0.8,
     eval_ratio: float = 0.1,
     test_ratio: float = 0.1,
+    dataset_type: str = 'P5',
+    # recbole configs
+    # P5 configs
+    P5_TO=True,
+    
 ) -> InteractionData:
     """
     Load dataset with train/eval/test split (matching main_pure.py style).
@@ -189,6 +222,7 @@ def load_dataset(
         dataset=dataset, 
         config_dict=config_dict,
     )
+    # assert 
     recbole_init_seed(cfg['seed'], reproducibility=True) # TODO: check if this is correct
     ds = create_dataset(cfg)
     print(ds)
@@ -197,38 +231,63 @@ def load_dataset(
 
     uid_field, iid_field = ds.uid_field, ds.iid_field
     iid_list_field = f'{iid_field}_list'
-
-    # Extract data from dataloaders (with optional filtering)
-    if filter_train and model != "BPR":
-        train_user_ids, train_item_id_lists, train_item_ids = filter_dataset_one_per_user(train, ds, cfg)
-    else:
-        train_user_ids = train.dataset.inter_feat.interaction[uid_field]
-        train_item_id_lists = train.dataset.inter_feat.interaction[iid_list_field]
-        train_item_ids = train.dataset.inter_feat.interaction[iid_field]
     
-    if filter_eval and model != "BPR":
-        eval_user_ids, eval_item_id_lists, eval_item_ids = filter_dataset_one_per_user(valid, ds, cfg)
+    if dataset_type == 'recbole':
+        # every item serves as a target item in one dataset sample
+        train_user_ids = train.dataset.inter_feat.interaction[uid_field].tolist()
+        train_item_id_lists = train.dataset.inter_feat.interaction[iid_list_field].tolist()
+        train_item_ids = train.dataset.inter_feat.interaction[iid_field].tolist()
+        
+        eval_user_ids = valid.dataset.inter_feat.interaction[uid_field].tolist()
+        eval_item_id_lists = valid.dataset.inter_feat.interaction[iid_list_field].tolist()
+        eval_item_ids = valid.dataset.inter_feat.interaction[iid_field].tolist()
+        
+        test_user_ids = test.dataset.inter_feat.interaction[uid_field].tolist()
+        test_item_id_lists = test.dataset.inter_feat.interaction[iid_list_field].tolist()
+        test_item_ids = test.dataset.inter_feat.interaction[iid_field].tolist()        
+        
+        
+    elif dataset_type == 'P5':
+        full_user_ids, full_item_id_lists, full_item_ids = keep_longest_per_user(test, ds, cfg)
+        full_histories = [full_item_id_lists[i] + [full_item_ids[i]] for i in range(len(full_item_id_lists))]
+        train_user_ids, train_item_id_lists, train_item_ids = [], [], []
+        eval_user_ids, eval_item_id_lists, eval_item_ids = [], [], []
+        test_user_ids, test_item_id_lists, test_item_ids = [], [], []
+        
+        for user_id, full_history in zip(full_user_ids, full_histories):
+            mask = get_mask(P5_TO, [train_ratio, eval_ratio, test_ratio], len(full_history))
+            # Convert to numpy array for efficient indexing
+            item_id_arr = np.array(full_history)
+            
+            # Build masks using numpy concatenation
+            train_mask = mask['train']
+            train_eval_mask = np.concatenate([mask['train'], mask['train_gt']])
+            train_eval_test_mask = np.concatenate([mask['train'], mask['train_gt'], mask['eval']])
+            
+            train_user_ids.append(user_id)
+            train_item_id_lists.append(item_id_arr[train_mask].tolist())
+            train_item_ids.append(item_id_arr[mask['train_gt']].tolist())
+            eval_user_ids.append(user_id)
+            eval_item_id_lists.append(item_id_arr[train_eval_mask].tolist())
+            eval_item_ids.append(item_id_arr[mask['eval']].tolist())
+            test_user_ids.append(user_id)
+            test_item_id_lists.append(item_id_arr[train_eval_test_mask].tolist())
+            test_item_ids.append(item_id_arr[mask['test']].tolist())
+        
+        
+        
     else:
-        eval_user_ids = valid.dataset.inter_feat.interaction[uid_field]
-        eval_item_id_lists = valid.dataset.inter_feat.interaction[iid_list_field]
-        eval_item_ids = valid.dataset.inter_feat.interaction[iid_field]
-    
-    if filter_test and model != "BPR":
-        test_user_ids, test_item_id_lists, test_item_ids = filter_dataset_one_per_user(test, ds, cfg)
-    else:
-        test_user_ids = test.dataset.inter_feat.interaction[uid_field]
-        test_item_id_lists = test.dataset.inter_feat.interaction[iid_list_field]
-        test_item_ids = test.dataset.inter_feat.interaction[iid_field]
+        raise ValueError(f"Unsupported dataset type: {dataset_type}")
     return InteractionData(
         raw_ds, 
-        train_user_ids.tolist(), 
-        train_item_id_lists.tolist(), 
-        train_item_ids.tolist(), 
-        eval_user_ids.tolist(), 
-        eval_item_id_lists.tolist(), 
-        eval_item_ids.tolist(), 
-        test_user_ids.tolist(), 
-        test_item_id_lists.tolist(), 
-        test_item_ids.tolist(),
+        train_user_ids, 
+        train_item_id_lists, 
+        train_item_ids, 
+        eval_user_ids, 
+        eval_item_id_lists, 
+        eval_item_ids, 
+        test_user_ids, 
+        test_item_id_lists, 
+        test_item_ids,
     )
 

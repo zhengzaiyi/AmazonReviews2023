@@ -77,7 +77,7 @@ from trl.trainer.utils import (
     truncate_with_protected_tokens,
     unsplit_pixel_values_by_grid,
 )
-from GRPO.models.soft_utils import multi_channel_recall_softmax, compute_ndcg_at_k, gumbel_softmax_sample
+from GRPO.models.soft_utils import multi_channel_recall_score, multi_channel_merge_cached, multi_channel_topk_cached, compute_ndcg_at_k, gumbel_softmax_sample
 from GRPO.core.utils import recall_at_k
 
 if is_peft_available():
@@ -1699,18 +1699,17 @@ class GRPOTrainer(Trainer):
                     continue
                 
                 # Use cached recaller outputs with current weights
-                candidates = defaultdict(float)
                 cached_outputs = recaller_cache[cache_key]
-                for j, name in enumerate(recaller_names):
-                    weight = weights[j].item() if torch.is_tensor(weights[j]) else weights[j]
-                    name_lower = name.lower()
-                    if name_lower in cached_outputs:
-                        for item_id, score in cached_outputs[name_lower]:
-                            candidates[item_id] += score * weight
-                
-                sorted_items = sorted(candidates.items(), key=lambda x: x[1], reverse=True)[:final_k]
+                merge_method = getattr(self, 'pure_merge_method', 'score')  # 'score' or 'topk'
+                if merge_method == 'topk':
+                    sorted_items = multi_channel_topk_cached(
+                        weights, cached_outputs, recaller_names, final_k
+                    )
+                else:  # default: 'score'
+                    sorted_items = multi_channel_merge_cached(
+                        weights, cached_outputs, recaller_names, final_k
+                    )
                 rec_list = [item_id for item_id, _ in sorted_items]
-                
                 reward = compute_ndcg_at_k(rec_list, ground_truth, final_k)
                 rewards.append(reward)
                 # Compute eval metrics

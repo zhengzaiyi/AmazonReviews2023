@@ -4,6 +4,11 @@ import os
 from functools import partial
 from typing import Any, List, Dict, Tuple
 import sys
+import warnings
+import math
+from typing import Dict, List, Tuple, Optional, Union
+# Suppress pandas FutureWarning from recbole
+warnings.filterwarnings('ignore', category=FutureWarning, message='.*A value is trying to be set on a copy of a DataFrame.*')
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
@@ -16,7 +21,6 @@ from tqdm import tqdm
 from collections import defaultdict
 from transformers import (
     AutoModelForSequenceClassification, 
-    AutoModelForSeq2SeqLM,
     AutoModelForCausalLM,
     AutoTokenizer, 
     TrainingArguments, 
@@ -26,15 +30,22 @@ from transformers import (
 )
 from transformers.trainer_utils import get_last_checkpoint
 from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix
+import wandb
 
 from GRPO.core.agents import UserProfileAgent
 from GRPO.core.data import load_dataset
 from GRPO.models.main import initialize_recallers
 from GRPO.core.recallers import RecBoleRecaller
-from GRPO.core.utils import set_seed, build_prompt, ndcg_at_k, recall_at_k
-from GRPO.models.soft_utils import multi_channel_recall_softmax, compute_ndcg_at_k as soft_ndcg
+from GRPO.core.utils import set_seed, build_prompt, ndcg_at_k, recall_at_k, TOOLS_DESCRIPTION
+from GRPO.models.soft_utils import multi_channel_recall_score, multi_channel_recall_top_k, compute_ndcg_at_k as soft_ndcg
 from GRPO.trainers.trl_trainer import GRPOTrainer
-from GRPO.models.soft_utils import multi_channel_recall_softmax, compute_ndcg_at_k
+from GRPO.models.soft_utils import multi_channel_recall_score, compute_ndcg_at_k
+from GRPO.models.normalization import normalize_scores
+from GRPO.models.evaluation_utils import (
+    evaluate_base_recallers, aggregate_metrics, print_base_recaller_table,
+    find_best_base_model, print_comparison_table, extract_eval_data
+)
+from GRPO.models.model_utils import load_model_and_tokenizer, load_label_mapping, load_hint_map, load_model_only
 from trl import GRPOConfig
 
 
@@ -89,61 +100,45 @@ def create_sft_dataset(
     
     for i, uid in tqdm(enumerate(user_ids)):
         hist = histories[i]
+        gt_items = target_items[i]
         if 0 in hist:
             hist = hist[:hist.index(0)]
         
-        # Combine history with target as full history (target is the last item)
-        full_hist = hist + [target_items[i]]
-        
-        # Fixed history length for eval_hist
-        
-        # n_gt: number of ground truth items following eval_hist
-        n_gt_ratio = 0.1
-        fixed_hist_len = min(profile_cutoff, int(len(full_hist) - 1))
-        # n_gt = max(1, min(5, int(fixed_hist_len * n_gt_ratio)))
-        n_gt = 1
-        
-        # Determine sliding window start positions for augmentation
-        # Each window: eval_hist = full_hist[start:start+fixed_hist_len], gt_items = full_hist[start+fixed_hist_len:start+fixed_hist_len+n_gt]
-        if use_augmentation and len(full_hist) >= MIN_HISTORY_FOR_AUGMENTATION:
-            # Sliding window: different start positions, fixed history length
-            # Ensure we have enough items: start_pos + fixed_hist_len + n_gt <= len(full_hist)
-            max_start = max(0, len(full_hist) - fixed_hist_len - n_gt)
-            start_positions = list(range(0, max_start + 1, AUGMENTATION_STEP))
-            # Always include the last valid position
-            if max_start not in start_positions:
-                start_positions.append(max_start)
-        else:
-            # No augmentation: only use the last window (most recent history)
-            start_pos = max(0, len(full_hist) - fixed_hist_len - n_gt)
-            start_positions = [start_pos]
+        fixed_hist_len = min(profile_cutoff, int(len(hist)))
+        start_pos = max(0, len(hist) - fixed_hist_len)
+        start_positions = [start_pos]
         
         for start_pos in start_positions:
-            gt_items = full_hist[start_pos + fixed_hist_len:start_pos + fixed_hist_len + n_gt]
+            
             if random_history_selection:
                 # 随机选择历史项：从 gt_items 之前的所有项中随机选择 profile_cutoff 个，保持时间顺序
-                available_hist = full_hist[:start_pos + fixed_hist_len]
+                available_hist = hist
                 if len(available_hist) >= profile_cutoff:
                     selected_indices = sorted(np.random.choice(len(available_hist), profile_cutoff, replace=False))
                     eval_hist = [available_hist[i] for i in selected_indices]
                 else:
                     eval_hist = available_hist
             else:
-                eval_hist = full_hist[start_pos:start_pos + fixed_hist_len]
+                eval_hist = hist[start_pos:]
             
-            if len(gt_items) < 1:
-                continue
+            # if len(gt_items) < 1:
+            #     continue
             
             # Find best recaller and collect scores
             # Mask all interacted items except gt_items for fair evaluation
             recaller_scores = {}
+            recaller_top_items = {}  # Store top 3 items for each recaller
             best_ndcg, best_recaller = -1, None
             for recaller_name, recaller in recallers.items():
-                items = recaller.recall(uid, final_k, eval_hist, full_hist=full_hist, gt_items=gt_items)
+                items = recaller.recall(uid, final_k, hist, full_hist=hist + gt_items, gt_items=gt_items)
                 item_ids = [item[0] for item in items] if items else []
                 ndcg = ndcg_at_k(item_ids, gt_items, k=final_k)
                 metrics[recaller_name]["ndcg"].append(ndcg)
                 recaller_scores[recaller_name] = ndcg
+                # Store top 3 items with their metadata (same format as history)
+                recaller_top_items[recaller_name] = [
+                    profile_agent.item_feat.get(iid, {}) for iid in item_ids[:3]
+                ]
                 
                 if ndcg > best_ndcg:
                     best_ndcg = ndcg
@@ -163,7 +158,27 @@ def create_sft_dataset(
             else:
                 hint = ""
             
+            # Build available models description with top 3 retrieved items
+            models_with_items = []
+            for m in recaller_names:
+                desc = TOOLS_DESCRIPTION.get(m.lower(), {}).get("description", "")
+                top_items = recaller_top_items.get(m, [])
+                models_with_items.append({
+                    "name": m,
+                    "description": desc,
+                    "top_retrieved_items": top_items
+                })
+            
             base_prompt = build_prompt(user_profile, available_models=recaller_names, type='classification')
+            # Replace the simple available models list with detailed description
+            models_str = "\n".join([
+                f"- {m['name']}: {m['description']}\n  Top retrieved items: {json.dumps(m['top_retrieved_items'], ensure_ascii=False)}"
+                for m in models_with_items
+            ])
+            base_prompt = base_prompt.replace(
+                f"Available models: \n{[m for m in recaller_names]}\n",
+                f"Available models:\n{models_str}\n"
+            )
             if hint:
                 prompt = base_prompt.replace("Your response:", f"\nNote: Based on this user's historical interactions, {hint} has shown the best performance.\nYour response:")
             else:
@@ -178,7 +193,7 @@ def create_sft_dataset(
                 "user_id": uid,
                 "history": eval_hist,  # For GRPO reward computation
                 "target_items": gt_items,  # For GRPO reward computation
-                "full_hist": full_hist,  # All interacted items for masking during evaluation
+                "full_hist": hist + gt_items,  # All interacted items for masking during evaluation
                 "history_len_used": len(eval_hist),
             }
             
@@ -438,43 +453,33 @@ def evaluate_pure_model(model, tokenizer, test_dataset, id2label, recallers=None
             all_labels.append(example["labels"])
             
             # Generate recommendations if recallers are provided
-            if recallers is not None:
-                predicted_recaller_name = id2label[prediction]
-                true_recaller_name = example["best_recaller"]
+            predicted_recaller_name = id2label[prediction]
+            true_recaller_name = example["best_recaller"]
                 
-                # Get data directly from example (already computed in create_sft_dataset)
-                user_id = example["user_id"]
-                eval_hist = example["history"]
-                gt_items = example["target_items"]
-                full_hist = example.get("full_hist", None)  # For masking interacted items
+            # Get data directly from example (already computed in create_sft_dataset)
+            user_id, eval_hist, gt_items, full_hist = extract_eval_data(example, idx)
                     
-                # Generate recommendations using predicted recaller
-                if predicted_recaller_name in recallers and len(eval_hist) >= 5:
-                    predicted_recaller = recallers[predicted_recaller_name]
-                    pred_items = predicted_recaller.recall(user_id, final_k, eval_hist, full_hist=full_hist, gt_items=gt_items)
-                    pred_item_ids = [item[0] for item in pred_items] if pred_items else []
-                    pred_ndcg = ndcg_at_k(pred_item_ids, gt_items, k=final_k)
-                    pred_recall = recall_at_k(pred_item_ids, gt_items, k=final_k)
-                else:
-                    print(f"Predicted recaller {predicted_recaller_name} not in recallers")
-                    pred_item_ids = []
-                    pred_ndcg = 0.0
-                    pred_recall = 0.0
+            # Generate recommendations using predicted recaller
+            predicted_recaller = recallers[predicted_recaller_name]
+            pred_items = predicted_recaller.recall(user_id, final_k, eval_hist, full_hist=full_hist, gt_items=gt_items)
+            pred_item_ids = [item[0] for item in pred_items] if pred_items else []
+            pred_ndcg = ndcg_at_k(pred_item_ids, gt_items, k=final_k)
+            pred_recall = recall_at_k(pred_item_ids, gt_items, k=final_k)
                 
                 # Generate recommendations using true recaller for comparison
-                if true_recaller_name in recallers and len(eval_hist) >= 5:
-                    true_recaller = recallers[true_recaller_name]
-                    true_items = true_recaller.recall(user_id, final_k, eval_hist, full_hist=full_hist, gt_items=gt_items)
-                    true_item_ids = [item[0] for item in true_items] if true_items else []
-                    true_ndcg = ndcg_at_k(true_item_ids, gt_items, k=final_k)
-                    true_recall = recall_at_k(true_item_ids, gt_items, k=final_k)
-                else:
-                    print(f"True recaller {true_recaller_name} not in recallers")
-                    true_item_ids = []
-                    true_ndcg = 0.0
-                    true_recall = 0.0
+            if true_recaller_name in recallers and len(eval_hist) >= 5:
+                true_recaller = recallers[true_recaller_name]
+                true_items = true_recaller.recall(user_id, final_k, eval_hist, full_hist=full_hist, gt_items=gt_items)
+                true_item_ids = [item[0] for item in true_items] if true_items else []
+                true_ndcg = ndcg_at_k(true_item_ids, gt_items, k=final_k)
+                true_recall = recall_at_k(true_item_ids, gt_items, k=final_k)
+            else:
+                print(f"True recaller {true_recaller_name} not in recallers")
+                true_item_ids = []
+                true_ndcg = 0.0
+                true_recall = 0.0
                 
-                recommendation_results.append({
+            recommendation_results.append({
                     "user_id": user_id,
                     "predicted_recaller": predicted_recaller_name,
                     "true_recaller": true_recaller_name,
@@ -489,7 +494,7 @@ def evaluate_pure_model(model, tokenizer, test_dataset, id2label, recallers=None
                     "true_recall": true_recall,
                     "correct_prediction": predicted_recaller_name == true_recaller_name,
                     "history_length": len(eval_hist)
-                })
+            })
     
     # Calculate classification metrics
     all_predictions = np.array(all_predictions)
@@ -637,83 +642,24 @@ def evaluate_pure_model(model, tokenizer, test_dataset, id2label, recallers=None
     
     return result
 
-
-def multi_channel_recall_average(
-    recallers: Dict,
-    recaller_names: List[str],
-    user_id: int,
-    history: List[int],
-    total_k: int,
-    full_hist: List[int] = None,
-    gt_items: List[int] = None,
-    normalize_scores: str = None
-) -> List[Tuple[int, float]]:
-    """
-    Multi-channel recall using average (uniform) weights.
-    Each recaller has equal weight = 1/n.
-    
-    Args:
-        normalize_scores: Normalization method for scores before merging. Options:
-            - None: No normalization (default, original behavior)
-            - 'minmax': Min-Max normalization to [0, 1]
-            - 'zscore': Z-score normalization (mean=0, std=1)
-            - 'softmax': Softmax normalization (sum to 1)
-    """
-    import numpy as np
-    import torch
-    
-    candidates = defaultdict(float)
-    num_recallers = len(recaller_names)
-    weight = 1.0 / num_recallers
-    
-    for name in recaller_names:
-        name_lower = name.lower()
-        if name_lower in recallers:
-            items = recallers[name_lower].recall(user_id, total_k, history, full_hist=full_hist, gt_items=gt_items)
-            
-            if items:
-                item_ids = [item[0] for item in items]
-                scores = [item[1] for item in items]
-                
-                # Normalize scores if requested
-                if normalize_scores == 'minmax':
-                    min_score, max_score = min(scores), max(scores)
-                    if max_score > min_score:
-                        scores = [(s - min_score) / (max_score - min_score) for s in scores]
-                    else:
-                        scores = [0.5] * len(scores)  # All same score, set to 0.5
-                elif normalize_scores == 'zscore':
-                    mean_score = np.mean(scores)
-                    std_score = np.std(scores)
-                    if std_score > 1e-8:
-                        scores = [(s - mean_score) / std_score for s in scores]
-                    else:
-                        scores = [0.0] * len(scores)  # All same score, set to 0
-                elif normalize_scores == 'softmax':
-                    # Convert to numpy for softmax
-                    scores_tensor = torch.tensor(scores, dtype=torch.float32)
-                    scores_softmax = torch.softmax(scores_tensor, dim=0).tolist()
-                    scores = scores_softmax
-                
-                # Merge normalized scores with weights
-                for item_id, norm_score in zip(item_ids, scores):
-                    candidates[item_id] += norm_score * weight
-    
-    sorted_items = sorted(candidates.items(), key=lambda x: x[1], reverse=True)
-    return sorted_items[:total_k]
-
-
 def evaluate_baseline_recallers(
     test_dataset,
     recallers: Dict[str, RecBoleRecaller],
     recaller_names: List[str],
     final_k: int = 50,
     save_predictions: bool = True,
-    normalize_scores: str = None
+    merge_method: str = "average",
+    score_norm: Optional[str] = None,
+    score_norm_kwargs: Optional[dict] = None,
 ):
     """
-    Evaluate baseline recallers and average fusion without model.
+    Evaluate baseline recallers and fusion without model.
     This is a standalone baseline evaluation that doesn't require a model.
+    
+    Args:
+        merge_method: Method for merging recaller results. Options:
+            - 'average': Use multi_channel_recall_score with uniform weights
+            - 'top_k': Use multi_channel_recall_top_k (keep highest scores)
     """
     metrics = {
         "avg_score_weight": defaultdict(list),  # Average score-weight (uniform)
@@ -722,56 +668,73 @@ def evaluate_baseline_recallers(
     for recaller_name in recaller_names:
         metrics[recaller_name] = defaultdict(list)
     
-    # Store predictions for avg_recall
-    predictions = {
-        "avg_score_weight": [],  # avg_recall predictions
-    }
+    # Store predictions
+    predictions = []
     
     for idx, example in enumerate(tqdm(test_dataset, desc="Evaluating Baselines")):
         # Get data directly from example
-        user_id = example.get("user_id", idx)
-        eval_hist = example["history"]
-        gt_items = example["target_items"]
-        full_hist = example.get("full_hist", None)  # For masking interacted items
+        user_id, eval_hist, gt_items, full_hist = extract_eval_data(example, idx)
         
         if len(eval_hist) < 5:
             continue
         
-        # 1. Multi-channel recall with average (uniform) score-weight
-        avg_candidates = multi_channel_recall_average(
-            recallers, recaller_names, user_id, eval_hist, final_k,
-            full_hist=full_hist, gt_items=gt_items,
-            normalize_scores=normalize_scores
-        )
+        # Collect predictions from all recallers
+        recaller_predictions = {}
+        for recaller_name in recaller_names:
+            if recaller_name in recallers:
+                items = recallers[recaller_name].recall(user_id, final_k, eval_hist, full_hist=full_hist, gt_items=gt_items)
+                # Store as list of [item_id, score] tuples
+                recaller_predictions[recaller_name] = [[int(item_id), float(score)] for item_id, score in items] if items else []
+        
+        # 1. Multi-channel recall fusion
+        if merge_method == "top_k":
+            avg_candidates = multi_channel_recall_top_k(
+                recallers, recaller_names, user_id, eval_hist, final_k,
+                full_hist=full_hist, gt_items=gt_items
+            )
+        else:  # default: "average"
+            # Use multi_channel_recall_score with uniform weights
+            num_recallers = len(recaller_names)
+            uniform_weights = torch.ones(num_recallers) / num_recallers
+            avg_candidates = multi_channel_recall_score(
+                softmax_weights=uniform_weights,
+                recallers=recallers,
+                recaller_names=recaller_names,
+                user_id=user_id,
+                history=eval_hist,
+                total_k=final_k,
+                full_hist=full_hist,
+                gt_items=gt_items,
+                score_norm=score_norm,
+                score_norm_kwargs=score_norm_kwargs
+            )
         avg_rec = [item_id for item_id, _ in avg_candidates]
         for k in [10, 20, 50]:
             metrics["avg_score_weight"][f"ndcg@{k}"].append(ndcg_at_k(avg_rec, gt_items, k))
             metrics["avg_score_weight"][f"recall@{k}"].append(recall_at_k(avg_rec, gt_items, k))
         
-        # Save avg_score_weight (avg_recall) predictions
+        # Save predictions
         if save_predictions:
-            predictions["avg_score_weight"].append({
+            # For baseline, merge weights are uniform (1/n for each recaller)
+            num_recallers = len(recaller_names)
+            uniform_weights_list = [1.0 / num_recallers] * num_recallers
+            predictions.append({
                 "user_id": user_id,
-                "predicted_items": avg_rec,
-                "gt_items": gt_items
+                "recaller_predictions": recaller_predictions,
+                "gt_items": gt_items,
+                "merge_weights": uniform_weights_list  # Uniform weights for baseline
             })
         
         # 2. Evaluate each base recaller
         for recaller_name in recaller_names:
             if recaller_name in recallers:
-                items = recallers[recaller_name].recall(user_id, final_k, eval_hist, full_hist=full_hist, gt_items=gt_items)
-                base_rec = [item[0] for item in items] if items else []
+                base_rec = [item[0] for item in recaller_predictions[recaller_name]]
                 for k in [10, 20, 50]:
                     metrics[recaller_name][f"ndcg@{k}"].append(ndcg_at_k(base_rec, gt_items, k))
                     metrics[recaller_name][f"recall@{k}"].append(recall_at_k(base_rec, gt_items, k))
     
     # Aggregate results
-    results = {}
-    for method, method_metrics in metrics.items():
-        results[method] = {}
-        for metric_name, values in method_metrics.items():
-            if values:
-                results[method][metric_name] = np.mean(values)
+    results = aggregate_metrics(metrics)
     
     # Print comparison
     print("\n" + "="*60)
@@ -779,23 +742,13 @@ def evaluate_baseline_recallers(
     print("="*60)
     
     # Print base recaller performance
-    print(f"\n--- Base Recaller Performance ---")
-    header = f"{'Metric':<15}" + "".join([f"{name:>15}" for name in recaller_names])
-    print(header)
-    print("-" * (15 + 15 * len(recaller_names)))
-    for k in [10, 20, 50]:
-        for metric in ['ndcg', 'recall']:
-            key = f"{metric}@{k}"
-            row = f"{key:<15}"
-            for recaller_name in recaller_names:
-                val = results.get(recaller_name, {}).get(key, 0)
-                row += f"{val:>15.4f}"
-            print(row)
+    print_base_recaller_table(results, recaller_names)
     
     # Print avg_score_weight performance
     if results.get("avg_score_weight"):
-        print(f"\n--- Average Score-Weight (Uniform) Performance ---")
-        print(f"{'Metric':<15} {'Avg-SW':>15}")
+        method_name = "Top-K Merge" if merge_method == "top_k" else "Average Score-Weight (Uniform)"
+        print(f"\n--- {method_name} Performance ---")
+        print(f"{'Metric':<15} {'Fusion':>15}")
         print("-" * 30)
         for k in [10, 20, 50]:
             for metric in ['ndcg', 'recall']:
@@ -804,18 +757,13 @@ def evaluate_baseline_recallers(
                 print(f"{key:<15} {avg_sw:>15.4f}")
     
     # Find best base model
-    best_base_ndcg = 0
-    best_base_name = None
-    for recaller_name in recaller_names:
-        ndcg50 = results.get(recaller_name, {}).get("ndcg@50", 0)
-        if ndcg50 > best_base_ndcg:
-            best_base_ndcg = ndcg50
-            best_base_name = recaller_name
+    best_base_name, best_base_ndcg = find_best_base_model(results, recaller_names)
     
     # Print comparison
     if results.get("avg_score_weight"):
-        print(f"\n--- Avg-SW vs Best Base Recaller ---")
-        print(f"{'Metric':<15} {'Avg-SW':>15} {'Best Base':>15} {'Improvement':>15}")
+        fusion_label = "Fusion" if merge_method == "top_k" else "Avg-SW"
+        print(f"\n--- {fusion_label} vs Best Base Recaller ---")
+        print(f"{'Metric':<15} {fusion_label:>15} {'Best Base':>15} {'Improvement':>15}")
         print("-" * 60)
         for k in [10, 20, 50]:
             for metric in ['ndcg', 'recall']:
@@ -839,33 +787,47 @@ def evaluate_multi_channel_recall(
     recallers: Dict[str, RecBoleRecaller],
     recaller_names: List[str],
     final_k: int = 50,
-    use_softmax_weights: bool = True,
+    merge_method: str = "average",
     save_predictions: bool = True,
-    normalize_scores: str = None
+    score_norm: Optional[str] = None,
+    score_norm_kwargs: Optional[dict] = None,
+    id2label: Optional[Dict[int, str]] = None,
 ):
     """
     Evaluate model using multi-channel recall with softmax weights.
     
     Instead of selecting a single recaller, uses the softmax output
     as weights for aggregating candidates from all recallers.
+    
+    Args:
+        id2label: Optional mapping from label id to recaller name. If provided,
+                  recaller_names will be ordered according to id2label to ensure
+                  softmax_weights[i] corresponds to recaller_names[i].
     """
     device = model.device
     model.eval()
+    
+    # Ensure recaller_names order matches id2label if provided
+    # This ensures softmax_weights[i] corresponds to recaller_names[i]
+    if id2label is not None:
+        # Create ordered list based on id2label: [id2label[0], id2label[1], ...]
+        ordered_recaller_names = [id2label[i] for i in sorted(id2label.keys())]
+        # Verify all recaller_names are in id2label
+        if set(ordered_recaller_names) == set(recaller_names):
+            recaller_names = ordered_recaller_names
     
     metrics = {
         "single_select": defaultdict(list),  # Best single recaller
         "multi_channel": defaultdict(list),   # Weighted multi-channel (softmax)
         "avg_score_weight": defaultdict(list),  # Average score-weight (uniform)
+        "avg_top_k": defaultdict(list),  # Average top-k (uniform weights with quota-based scheduling)
     }
     # Add metrics for each base recaller
     for recaller_name in recaller_names:
         metrics[recaller_name] = defaultdict(list)
     
-    # Store predictions for avg_recall and best_recall (multi_channel)
-    predictions = {
-        "multi_channel": [],  # best_recall predictions
-        "avg_score_weight": [],  # avg_recall predictions
-    }
+    # Store predictions
+    predictions = []
     
     with torch.no_grad():
         for idx, example in enumerate(tqdm(test_dataset, desc="Evaluating Multi-Channel")):
@@ -880,81 +842,104 @@ def evaluate_multi_channel_recall(
             softmax_weights = torch.softmax(logits, dim=-1)
             
             # Get data directly from example (already computed in create_sft_dataset)
-            user_id = example.get("user_id", idx)
-            eval_hist = example["history"]
-            gt_items = example["target_items"]
-            full_hist = example.get("full_hist", None)  # For masking interacted items
+            user_id, eval_hist, gt_items, full_hist = extract_eval_data(example, idx)
             
             if len(eval_hist) < 5:
                 continue
+            
+            # Collect predictions from all recallers
+            recaller_predictions = {}
+            for recaller_name in recaller_names:
+                items = recallers[recaller_name].recall(user_id, final_k, eval_hist, full_hist=full_hist, gt_items=gt_items)
+                # Store as list of [item_id, score] tuples
+                recaller_predictions[recaller_name] = [[int(item_id), float(score)] for item_id, score in items] if items else []
             
             # 1. Single recaller selection (argmax)
             pred_idx = logits.argmax().item()
             pred_recaller = recaller_names[pred_idx]
             # Use original name for lookup (consistent with evaluate_pure_model)
-            if pred_recaller in recallers:
-                items = recallers[pred_recaller].recall(user_id, final_k, eval_hist, full_hist=full_hist, gt_items=gt_items)
-                single_rec = [item[0] for item in items]
-                for k in [10, 20, 50]:
-                    metrics["single_select"][f"ndcg@{k}"].append(ndcg_at_k(single_rec, gt_items, k))
-                    metrics["single_select"][f"recall@{k}"].append(recall_at_k(single_rec, gt_items, k))
+            single_rec = [item[0] for item in recaller_predictions[pred_recaller]]
+            for k in [10, 20, 50]:
+                metrics["single_select"][f"ndcg@{k}"].append(ndcg_at_k(single_rec, gt_items, k))
+                metrics["single_select"][f"recall@{k}"].append(recall_at_k(single_rec, gt_items, k))
             
             # 2. Multi-channel recall with softmax weights
-            if use_softmax_weights:
-                candidates = multi_channel_recall_softmax(
+            if merge_method == "average":
+                candidates = multi_channel_recall_score(
                     softmax_weights, recallers, recaller_names,
                     user_id, eval_hist, final_k,
                     full_hist=full_hist, gt_items=gt_items,
-                    normalize_scores=normalize_scores
+                    score_norm=score_norm,
+                    score_norm_kwargs=score_norm_kwargs
                 )
-                multi_rec = [item_id for item_id, _ in candidates]
-                for k in [10, 20, 50]:
-                    metrics["multi_channel"][f"ndcg@{k}"].append(ndcg_at_k(multi_rec, gt_items, k))
-                    metrics["multi_channel"][f"recall@{k}"].append(recall_at_k(multi_rec, gt_items, k))
-                
-                # Save multi_channel (best_recall) predictions
-                if save_predictions:
-                    predictions["multi_channel"].append({
-                        "user_id": user_id,
-                        "predicted_items": multi_rec,
-                        "gt_items": gt_items
-                    })
+            elif merge_method == "top_k":
+                candidates = multi_channel_recall_top_k(
+                    recallers, recaller_names, user_id, eval_hist, final_k,
+                    full_hist=full_hist, gt_items=gt_items, weights=softmax_weights
+                )
+            multi_rec = [item_id for item_id, _ in candidates]
+            for k in [10, 20, 50]:
+                metrics["multi_channel"][f"ndcg@{k}"].append(ndcg_at_k(multi_rec, gt_items, k))
+                metrics["multi_channel"][f"recall@{k}"].append(recall_at_k(multi_rec, gt_items, k))
             
             # 3. Multi-channel recall with average (uniform) score-weight
-            avg_candidates = multi_channel_recall_average(
-                recallers, recaller_names, user_id, eval_hist, final_k,
-                full_hist=full_hist, gt_items=gt_items,
-                normalize_scores=normalize_scores
+            # Use multi_channel_recall_score with uniform weights
+            num_recallers = len(recaller_names)
+            uniform_weights = torch.ones(num_recallers) / num_recallers
+            avg_candidates = multi_channel_recall_score(
+                softmax_weights=uniform_weights,
+                recallers=recallers,
+                recaller_names=recaller_names,
+                user_id=user_id,
+                history=eval_hist,
+                total_k=final_k,
+                full_hist=full_hist,
+                gt_items=gt_items,
+                score_norm=score_norm,
+                score_norm_kwargs=score_norm_kwargs
             )
             avg_rec = [item_id for item_id, _ in avg_candidates]
             for k in [10, 20, 50]:
                 metrics["avg_score_weight"][f"ndcg@{k}"].append(ndcg_at_k(avg_rec, gt_items, k))
                 metrics["avg_score_weight"][f"recall@{k}"].append(recall_at_k(avg_rec, gt_items, k))
             
-            # Save avg_score_weight (avg_recall) predictions
+            # 4. Multi-channel recall with average (uniform) top-k scheduling
+            # Use multi_channel_recall_top_k with uniform weights
+            avg_topk_candidates = multi_channel_recall_top_k(
+                recallers=recallers,
+                recaller_names=recaller_names,
+                user_id=user_id,
+                history=eval_hist,
+                total_k=final_k,
+                full_hist=full_hist,
+                gt_items=gt_items,
+                weights=uniform_weights
+            )
+            avg_topk_rec = [item_id for item_id, _ in avg_topk_candidates]
+            for k in [10, 20, 50]:
+                metrics["avg_top_k"][f"ndcg@{k}"].append(ndcg_at_k(avg_topk_rec, gt_items, k))
+                metrics["avg_top_k"][f"recall@{k}"].append(recall_at_k(avg_topk_rec, gt_items, k))
+            
+            # Save predictions
             if save_predictions:
-                predictions["avg_score_weight"].append({
+                # Save merge weights (softmax weights from model)
+                merge_weights = softmax_weights.tolist() if hasattr(softmax_weights, 'tolist') else softmax_weights
+                predictions.append({
                     "user_id": user_id,
-                    "predicted_items": avg_rec,
-                    "gt_items": gt_items
+                    "recaller_predictions": recaller_predictions,
+                    "gt_items": gt_items,
+                    "merge_weights": merge_weights  # Softmax weights from model
                 })
             
-            # 4. Evaluate each base recaller
+            # 5. Evaluate each base recaller
             for recaller_name in recaller_names:
-                if recaller_name in recallers:
-                    items = recallers[recaller_name].recall(user_id, final_k, eval_hist, full_hist=full_hist, gt_items=gt_items)
-                    base_rec = [item[0] for item in items] if items else []
-                    for k in [10, 20, 50]:
-                        metrics[recaller_name][f"ndcg@{k}"].append(ndcg_at_k(base_rec, gt_items, k))
-                        metrics[recaller_name][f"recall@{k}"].append(recall_at_k(base_rec, gt_items, k))
+                base_rec = [item[0] for item in recaller_predictions[recaller_name]]
+                for k in [10, 20, 50]:
+                    metrics[recaller_name][f"ndcg@{k}"].append(ndcg_at_k(base_rec, gt_items, k))
+                    metrics[recaller_name][f"recall@{k}"].append(recall_at_k(base_rec, gt_items, k))
     
     # Aggregate results
-    results = {}
-    for method, method_metrics in metrics.items():
-        results[method] = {}
-        for metric_name, values in method_metrics.items():
-            if values:
-                results[method][metric_name] = np.mean(values)
+    results = aggregate_metrics(metrics)
     
     # Print comparison
     print("\n" + "="*60)
@@ -962,43 +947,24 @@ def evaluate_multi_channel_recall(
     print("="*60)
     
     # Print base recaller performance
-    print(f"\n--- Base Recaller Performance ---")
-    header = f"{'Metric':<15}" + "".join([f"{name:>15}" for name in recaller_names])
-    print(header)
-    print("-" * (15 + 15 * len(recaller_names)))
-    for k in [10, 20, 50]:
-        for metric in ['ndcg', 'recall']:
-            key = f"{metric}@{k}"
-            row = f"{key:<15}"
-            for recaller_name in recaller_names:
-                val = results.get(recaller_name, {}).get(key, 0)
-                row += f"{val:>15.4f}"
-            print(row)
+    print_base_recaller_table(results, recaller_names)
     
     # Find best base model
-    best_base_ndcg = 0
-    best_base_name = None
-    for recaller_name in recaller_names:
-        ndcg50 = results.get(recaller_name, {}).get("ndcg@50", 0)
-        if ndcg50 > best_base_ndcg:
-            best_base_ndcg = ndcg50
-            best_base_name = recaller_name
+    best_base_name, best_base_ndcg = find_best_base_model(results, recaller_names)
     
     # Print single select vs multi-channel comparison
     if results.get("single_select") and results.get("multi_channel"):
-        print(f"\n--- Model Selection vs Multi-Channel vs Avg Score-Weight ---")
-        print(f"{'Metric':<12} {'Single':>12} {'Multi-Ch':>12} {'Avg-SW':>12} {'Best Base':>12} {'Multi Impr':>12} {'Avg Impr':>12}")
-        print("-" * 84)
-        for k in [10, 20, 50]:
-            for metric in ['ndcg', 'recall']:
-                key = f"{metric}@{k}"
-                single = results["single_select"].get(key, 0)
-                multi = results["multi_channel"].get(key, 0)
-                avg_sw = results["avg_score_weight"].get(key, 0)
-                best_base = max(results.get(name, {}).get(key, 0) for name in recaller_names)
-                multi_impr = multi - best_base
-                avg_impr = avg_sw - best_base
-                print(f"{key:<12} {single:>12.4f} {multi:>12.4f} {avg_sw:>12.4f} {best_base:>12.4f} {multi_impr:>+12.4f} {avg_impr:>+12.4f}")
+        print_comparison_table(
+            results, recaller_names,
+            methods=["single_select", "multi_channel", "avg_score_weight", "avg_top_k"],
+            method_labels={
+                "single_select": "Single",
+                "multi_channel": "Multi-Ch",
+                "avg_score_weight": "Avg-SW",
+                "avg_top_k": "Avg-TK"
+            },
+            title="Model Selection vs Multi-Channel vs Avg Score-Weight vs Avg Top-K"
+        )
     
     # Add predictions to results
     if save_predictions:
@@ -1007,43 +973,26 @@ def evaluate_multi_channel_recall(
     return results
 
 
-def tokenize_function(examples, tokenizer, max_length=1536, seq2seq=False):
-    if seq2seq:
-        # For seq2seq: create input-output pairs
-        # Input: user profile text + special prompt
-        # Output: recaller name
-        inputs = []
-        targets = []
-        
+def tokenize_function(examples, tokenizer, max_length=1536, autoregressive=False):
+    if autoregressive:
+        # Build full sequence: prompt + label
+        full_texts = []
         for text, recaller in zip(examples["text"], examples["best_recaller"]):
-            # Create input-output format for causal LM
-            input_text = text + f"\n\nBest recaller:"
-            target_text = f" {recaller}"
-            
-            inputs.append(input_text)
-            targets.append(input_text + target_text)  # Full sequence for causal LM
+            full_text = text + f"\n\nBest recaller: {recaller}"
+            full_texts.append(full_text)
         
         # Tokenize full sequences
-        model_inputs = tokenizer(targets, padding="max_length", truncation=True, max_length=max_length)
+        model_inputs = tokenizer(full_texts, padding="max_length", truncation=True, max_length=max_length)
         
-        # Create labels: copy input_ids and set input portion to -100
+        # Autoregressive: labels = input_ids (next token prediction on full sequence)
+        # Only mask padding tokens
         labels = []
-        input_lengths = []
-        
-        for input_text in inputs:
-            input_tokens = tokenizer(input_text, truncation=True, max_length=max_length)
-            input_lengths.append(len(input_tokens["input_ids"]))
-        
-        for i, length in enumerate(input_lengths):
-            label = model_inputs["input_ids"][i].copy()
-            # Set input portion to -100 (ignored in loss)
-            label[:length] = [-100] * length
-            # Set padding tokens to -100
+        for input_ids in model_inputs["input_ids"]:
+            label = input_ids.copy()
             for j, token_id in enumerate(label):
                 if token_id == tokenizer.pad_token_id:
                     label[j] = -100
             labels.append(label)
-        
         model_inputs["labels"] = labels
         return model_inputs
     else:
@@ -1060,9 +1009,12 @@ def get_paths(args):
     recbole_models = args.recbole_models
     recbole_models.sort()
     recbole_models = '_'.join(recbole_models)
+    # Determine training mode prefix
+    mode_prefix = "ar_" if args.autoregressive else ""
     return {
         "model_name": args.model_name,
-        "sft": f"{base}_pure_{f'seq2seq_' if args.seq2seq else ''}sft_{recbole_models}",
+        "sft": f"{base}_pure_{mode_prefix}sft_{recbole_models}",
+        "ar_sft": f"{base}_pure_ar_sft_{recbole_models}",  # AR SFT path for pretraining
         "data": f"{base}_pure_sft_data_{recbole_models}_{args.profile_cutoff}",
         "grpo": f"{base}_pure_grpo_{recbole_models}",
         "grpo_data": f"{base}_pure_grpo_data_{recbole_models}_{args.profile_cutoff}"
@@ -1095,8 +1047,8 @@ def parse_args():
     parser.add_argument('--num_train_epochs', type=int, default=3)
     parser.add_argument('--warmup_steps', type=int, default=100)
     parser.add_argument('--logging_steps', type=int, default=10)
-    parser.add_argument('--save_steps', type=int, default=500)
-    parser.add_argument('--eval_steps', type=int, default=500)
+    parser.add_argument('--save_steps', type=int, default=1000)
+    parser.add_argument('--eval_steps', type=int, default=1000)
     parser.add_argument('--max_length', type=int, default=1536)
     # Other
     parser.add_argument('--final_k', type=int, default=50)
@@ -1108,8 +1060,8 @@ def parse_args():
                        help='Padding side for tokenizer. Use "left" for decoder-only models in classification.')
     parser.add_argument('--profile_cutoff', type=int, default=20,
                        help='Cutoff length for user profiles and minimum history length for augmentation.')
-    parser.add_argument('--seq2seq', action='store_true',
-                       help='Use seq2seq model instead of classification model.')
+    parser.add_argument('--autoregressive', action='store_true',
+                       help='Use autoregressive (next token prediction) on full sequence including prompt. Learns domain knowledge from entire sequence.')
     parser.add_argument('--use_dirichlet_head', action='store_true',
                        help='Use Dirichlet distribution head instead of softmax. Requires SoftLabelTrainer.')
     # GRPO training
@@ -1146,10 +1098,23 @@ def parse_args():
                         help='Temperature for soft label: higher = sharper distribution, lower = smoother.')
     parser.add_argument('--random_history_selection', action='store_true',
                         help='Randomly select profile_cutoff items from history instead of using the most recent ones.')
-    parser.add_argument('--normalize_scores', type=str, default=None,
-                        choices=[None, 'minmax', 'zscore', 'softmax'],
-                        help='Normalization method for scores before merging in multi-channel recall. '
-                             'Options: None (no normalization), minmax (to [0,1]), zscore (mean=0, std=1), softmax (sum to 1).')
+    parser.add_argument('--score_norm', type=str, default='minmax',
+                        choices=[None, 'none', 'minmax', 'zscore', 'softmax', 'percentile', 'rank_reciprocal', 'rank_exp', 'platt'],
+                        help='Rescoring method applied per channel before merging in multi-channel recall. '
+                             'Options: None/"none" (no change), minmax (per-channel min-max to [0,1]), '
+                             'zscore (per-channel z-score), softmax (per-channel softmax distribution), '
+                             'percentile (per-channel empirical CDF to [0,1]), '
+                             'rank_reciprocal (1/(offset+rank) using rank only), '
+                             'rank_exp (exp(-alpha*rank) using rank only), '
+                             'platt (sigmoid(a*s+b), requires score_norm_kwargs).')
+    parser.add_argument('--score_norm_kwargs', type=str, default=None,
+                        help='JSON string for additional kwargs for the chosen score_norm method. '
+                             'Example: \'{"temperature": 1.0}\' for softmax, \'{"offset": 1.0}\' for rank_reciprocal, '
+                             '\'{"alpha": 1.0}\' for rank_exp, \'{"a": 1.0, "b": 0.0}\' for platt.')
+    parser.add_argument('--merge_method', type=str, default='average',
+                        choices=['average', 'top_k'],
+                        help='Method for merging recaller results in baseline evaluation. '
+                             'Options: average (uniform weights), top_k (keep highest scores).')
     
     return parser.parse_args()
 
@@ -1158,6 +1123,21 @@ def main():
     args = parse_args()
     set_seed(args.seed)
     paths = get_paths(args)
+    
+    # Parse score_norm_kwargs JSON string if provided
+    score_norm_kwargs = None
+    if args.score_norm_kwargs:
+        try:
+            score_norm_kwargs = json.loads(args.score_norm_kwargs)
+        except json.JSONDecodeError as e:
+            print(f"Warning: Failed to parse --score_norm_kwargs as JSON: {e}. Ignoring it.")
+            score_norm_kwargs = None
+    
+    # Determine which score normalization to use
+    # Priority: score_norm > normalize_scores (for backward compatibility)
+    score_norm = args.score_norm
+    recaller_names = sorted(args.recbole_models)
+    recaller_names = [name.lower() for name in recaller_names]
     
 
     grpo_config = GRPOConfig(
@@ -1172,7 +1152,7 @@ def main():
         save_steps=args.save_steps,
         eval_strategy="steps",
         eval_steps=1000,
-        save_total_limit=3,
+        save_total_limit=1,
         bf16=args.bf16,
         fp16=args.fp16 and not args.bf16,
         # num_generations=2,
@@ -1190,9 +1170,6 @@ def main():
     if args.gen_sft_train or args.gen_sft_eval or args.gen_sft_test or args.do_test_sft or args.do_test_grpo or args.test_baseline:
         inter_dataset = load_dataset(
             args.dataset, args.data_path, seed=args.seed,
-            filter_train=True,
-            filter_eval=True,
-            filter_test=True,
         )
         profile_agent = UserProfileAgent(inter_dataset, args.dataset)
         recallers = initialize_recallers(
@@ -1242,10 +1219,8 @@ def main():
         print("Generating Train dataset with eval hints...")
         print("="*60)
         # Load eval hint map if available
-        eval_user_hint_map = {}
-        if os.path.exists(hint_map_path):
-            with open(hint_map_path, 'r') as f:
-                eval_user_hint_map = {int(k): v for k, v in json.load(f).items()}
+        eval_user_hint_map = load_hint_map(hint_map_path)
+        if eval_user_hint_map:
             print(f"Loaded eval hints for {len(eval_user_hint_map)} users")
         train_dataset, _, _, _ = create_sft_dataset(
             profile_agent, 
@@ -1268,10 +1243,8 @@ def main():
         print("Generating Test dataset with eval hints...")
         print("="*60)
         # Load eval hint map if available
-        eval_user_hint_map = {}
-        if os.path.exists(hint_map_path):
-            with open(hint_map_path, 'r') as f:
-                eval_user_hint_map = {int(k): v for k, v in json.load(f).items()}
+        eval_user_hint_map = load_hint_map(hint_map_path)
+        if eval_user_hint_map:
             print(f"Loaded eval hints for {len(eval_user_hint_map)} users")
         test_dataset, _, _, _ = create_sft_dataset(
             profile_agent,
@@ -1294,51 +1267,31 @@ def main():
     
     # Train model
     if args.do_sft:
+        # Initialize wandb
+        run_name = paths["sft"].split('/')[-1] + ("_soft" if args.use_soft_label else "") + ("_dirichlet" if args.use_dirichlet_head else "") + "_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+        wandb.init(project="pure-sft", name=run_name, config=vars(args))
+        
         # Load data
         train_dataset = Dataset.load_from_disk(f'{paths["data"]}/train')
         eval_dataset = Dataset.load_from_disk(f'{paths["data"]}/eval')
         test_dataset = Dataset.load_from_disk(f'{paths["data"]}/test')
-        with open(f'{paths["data"]}/label_mapping.json', 'r') as f:
-            labels = json.load(f)
-            label2id = labels["label2id"]
-            id2label = {int(k): v for k, v in labels["id2label"].items()}
         
-        # Setup model
-        dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
+        # Load label mapping
+        label2id, id2label = load_label_mapping(f'{paths["data"]}/label_mapping.json')
         
-        if args.seq2seq:
-            # Try seq2seq first, fallback to causal LM
-            try:
-                model = AutoModelForSeq2SeqLM.from_pretrained(
-                    args.model_name,
-                    torch_dtype=dtype,
-                    device_map="auto"
-                )
-            except:
-                model = AutoModelForCausalLM.from_pretrained(
-                    args.model_name,
-                    torch_dtype=dtype,
-                    device_map="auto"
-                )
-        else:
-            base_model = AutoModelForSequenceClassification.from_pretrained(
-                args.model_name,
-                num_labels=len(label2id),
-                id2label=id2label,
-                label2id=label2id,
-                torch_dtype=dtype,
-                device_map="auto"
-            )
-            # 如果使用狄利克雷头，包装模型
-            if args.use_dirichlet_head:
-                model = DirichletSequenceClassification(base_model)
-                print("Using DirichletSequenceClassification with Dirichlet distribution head")
-            else:
-                model = base_model
-            
-        tokenizer = safe_load_tokenizer(args.model_name)
-        tokenizer.pad_token = tokenizer.pad_token or tokenizer.eos_token
-        tokenizer.padding_side = args.padding_side
+        # For non-AR mode: use AR checkpoint as initialization if exists
+        base_model = args.model_name
+        if not args.autoregressive and os.path.exists(paths["ar_sft"]):
+            ar_ckpt = get_last_checkpoint(paths["ar_sft"]) or paths["ar_sft"]
+            if os.path.exists(os.path.join(ar_ckpt, "config.json")):
+                print(f"[SFT] Loading from AR checkpoint: {ar_ckpt}")
+                base_model = ar_ckpt
+        
+        # Load model and tokenizer
+        model, tokenizer = load_model_and_tokenizer(
+            base_model, args, label2id, id2label,
+            use_dirichlet_head=args.use_dirichlet_head
+        )
         
         # Disable gradient checkpointing for DeBERTa models (not compatible)
         use_gradient_checkpointing = args.gradient_checkpointing
@@ -1347,8 +1300,9 @@ def main():
             use_gradient_checkpointing = False
         
         # Tokenize
-        tokenize_fn = partial(tokenize_function, tokenizer=tokenizer, max_length=args.max_length, seq2seq=args.seq2seq)
-        if args.seq2seq:
+        tokenize_fn = partial(tokenize_function, tokenizer=tokenizer, max_length=args.max_length, 
+                             autoregressive=args.autoregressive)
+        if args.autoregressive:
             columns_to_remove = ["text", "labels", "best_ndcg", "user_id", "history_len_used"]
         else:
             columns_to_remove = ["text", "best_recaller", "best_ndcg", "user_id", "history_len_used"]
@@ -1364,7 +1318,7 @@ def main():
         tokenized_test = test_dataset.map(tokenize_fn, batched=True, 
                                          remove_columns=columns_to_remove)
         # Train
-        if args.seq2seq:
+        if args.autoregressive:
             data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
             compute_metrics_fn = partial(compute_metrics_seq2seq, tokenizer=tokenizer, label2id=label2id)
         else:
@@ -1374,13 +1328,15 @@ def main():
         # Use SoftLabelTrainer if soft labels are enabled or using Dirichlet head
         use_soft_trainer = args.use_soft_label or args.use_dirichlet_head
         TrainerClass = SoftLabelTrainer if use_soft_trainer else Trainer
+        # For autoregressive: use smaller eval batch and only compute loss (logits are huge)
+        eval_batch_size = 1 if args.autoregressive else 2
         trainer = TrainerClass(
             model=model,
             args=TrainingArguments(
                 output_dir=paths["sft"],
                 save_total_limit=1,
                 per_device_train_batch_size=args.per_device_train_batch_size,
-                per_device_eval_batch_size=args.per_device_train_batch_size,
+                per_device_eval_batch_size=eval_batch_size,
                 gradient_accumulation_steps=args.gradient_accumulation_steps,
                 num_train_epochs=args.num_train_epochs,
                 save_steps=1000,
@@ -1398,10 +1354,11 @@ def main():
                 load_best_model_at_end=True,  # 训练结束时加载最佳模型
                 report_to="wandb",
                 run_name=paths["sft"] + ("_soft" if args.use_soft_label else "") + ("_dirichlet" if args.use_dirichlet_head else "") + "_" + datetime.now().strftime("%Y%m%d_%H%M%S"),
-                seed=args.seed
+                seed=args.seed,
+                prediction_loss_only=args.autoregressive,  # Skip collecting huge logits for AR mode
             ),
-            train_dataset=tokenized_eval,
-            eval_dataset=tokenized_test,
+            train_dataset=tokenized_train,
+            eval_dataset=tokenized_eval,
             tokenizer=tokenizer,
             data_collator=data_collator,
             compute_metrics=compute_metrics_fn,
@@ -1412,6 +1369,7 @@ def main():
         trainer.train()
         trainer.save_model()
         tokenizer.save_pretrained(paths["sft"])
+        wandb.finish()
     
     # GRPO Training
     if args.do_grpo:
@@ -1434,29 +1392,29 @@ def main():
             )
         
         # Load label mapping
-        with open(f'{paths["data"]}/label_mapping.json', 'r') as f:
-            labels = json.load(f)
-            label2id = labels["label2id"]
-            id2label = {int(k): v for k, v in labels["id2label"].items()}
+        label2id, id2label = load_label_mapping(f'{paths["data"]}/label_mapping.json')
         
-        recaller_names = sorted(args.recbole_models)
-        
-        # Load SFT model as starting point
+        # For non-AR mode: use AR SFT checkpoint as initialization if exists
         sft_model_path = args.model_name
+        if not args.autoregressive and os.path.exists(paths["ar_sft"]):
+            ar_ckpt = get_last_checkpoint(paths["ar_sft"]) or paths["ar_sft"]
+            if os.path.exists(os.path.join(ar_ckpt, "config.json")):
+                print(f"[GRPO] Loading from AR checkpoint: {ar_ckpt}")
+                sft_model_path = ar_ckpt
         
-        dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
+        # Create a minimal args-like object for GRPO loading
+        class GRPOArgs:
+            bf16 = args.bf16
+            fp16 = args.fp16
+            padding_side = "left"
+            autoregressive = False
         
-        model = AutoModelForSequenceClassification.from_pretrained(
-            sft_model_path,
-            num_labels=len(label2id),
-            torch_dtype=dtype,
+        grpo_args = GRPOArgs()
+        model, tokenizer = load_model_and_tokenizer(
+            sft_model_path, grpo_args, label2id, id2label,
             device_map="cuda"
         )
-        
-        tokenizer = safe_load_tokenizer(sft_model_path)
-        tokenizer.pad_token = tokenizer.pad_token or tokenizer.eos_token
         model.config.pad_token_id = tokenizer.eos_token_id
-        tokenizer.padding_side = "left"
         
         # Load SFT dataset directly for GRPO (already contains prompt, history, target_items)
         grpo_train_dataset = Dataset.load_from_disk(f'{paths["data"]}/train')
@@ -1483,11 +1441,8 @@ def main():
         
         # Create reference model for KL penalty (override the default CausalLM ref_model)
         if args.beta > 0:
-            ref_model = AutoModelForSequenceClassification.from_pretrained(
-                sft_model_path,
-                num_labels=len(label2id),
-                torch_dtype=dtype,
-                device_map="cuda"
+            ref_model = load_model_only(
+                sft_model_path, grpo_args, label2id, id2label, device_map="cuda"
             )
             ref_model.config.pad_token_id = tokenizer.eos_token_id
             ref_model.eval()
@@ -1503,6 +1458,8 @@ def main():
         # Use k=5 for reward ndcg@k during GRPO (keep other stages unchanged)
         grpo_trainer.pure_final_k = 5
         grpo_trainer.pure_noise_scale = args.noise_scale
+        # Merge method: 'score' (weighted sum) or 'topk' (prefix-quota scheduling)
+        grpo_trainer.pure_merge_method = 'topk' if args.merge_method == 'top_k' else 'score'
         # SofT-GRPO loss (default) vs PPO-style loss
         grpo_trainer.use_soft_grpo_loss = not args.use_ppo_loss
         # Keep extra columns for reward computation (not removed by _remove_unused_columns)
@@ -1553,38 +1510,26 @@ def main():
                 else:
                     print(f"Warning: No checkpoint found in {model_path}")
             
-            with open(f'{paths["data"]}/label_mapping.json', 'r') as f:
-                labels = json.load(f)
-                id2label = {int(k): v for k, v in labels["id2label"].items()}
+            # Load label mapping
+            label2id, id2label = load_label_mapping(f'{paths["data"]}/label_mapping.json')
             
-            dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
-            
-            if args.seq2seq:
-                # Try seq2seq first, fallback to causal LM
-                try:
-                    model = AutoModelForSeq2SeqLM.from_pretrained(model_path, torch_dtype=dtype, device_map="auto")
-                except:
-                    model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=dtype, device_map="auto")
-            else:
-                model = AutoModelForSequenceClassification.from_pretrained(model_path, torch_dtype=dtype, device_map="auto")
-                
-            tokenizer = safe_load_tokenizer(model_path)
-            tokenizer.pad_token = tokenizer.eos_token
+            # Load model and tokenizer
+            model, tokenizer = load_model_and_tokenizer(
+                model_path, args, label2id=label2id, id2label=id2label
+            )
             model.config.pad_token_id = tokenizer.eos_token_id
-            tokenizer.padding_side = args.padding_side
         
         # Evaluate
-        if args.seq2seq:
-            print("Seq2seq evaluation not implemented yet.")
+        if args.autoregressive:
+            print("Autoregressive evaluation not implemented yet. Use training eval metrics instead.")
             return
         
-        recaller_combo = "_".join(sorted(args.recbole_models))
-        recaller_names = sorted(recallers.keys())
+        recaller_combo = "_".join(recaller_names)
         os.makedirs("results", exist_ok=True)
         
         base_config = {
             "dataset": args.dataset,
-            "recbole_models": args.recbole_models,
+            "recbole_models": recaller_names,
             "recaller_combo": recaller_combo,
             "final_k": args.final_k,
             "profile_cutoff": args.profile_cutoff,
@@ -1600,7 +1545,10 @@ def main():
             results = evaluate_pure_model(model, tokenizer, test_dataset, id2label, recallers, args.final_k)
             multi_results = evaluate_multi_channel_recall(
                 model, tokenizer, test_dataset, recallers, recaller_names,
-                args.final_k, use_softmax_weights=True, normalize_scores=args.normalize_scores
+                args.final_k, merge_method=args.merge_method, 
+                score_norm=score_norm,
+                score_norm_kwargs=score_norm_kwargs,
+                id2label=id2label
             )
             results["multi_channel_evaluation"] = multi_results
             results["config"] = {**base_config, "model_name": args.model_name, "model_path": model_path}
@@ -1625,9 +1573,12 @@ def main():
             print("="*60)
             baseline_results = evaluate_baseline_recallers(
                 test_dataset, recallers, recaller_names, args.final_k,
-                save_predictions=True, normalize_scores=args.normalize_scores
+                save_predictions=True, 
+                merge_method=args.merge_method,
+                score_norm=score_norm,
+                score_norm_kwargs=score_norm_kwargs
             )
-            baseline_results["config"] = {**base_config, "normalize_scores": args.normalize_scores}
+            baseline_results["config"] = {**base_config}
             
             # Save predictions
             if "predictions" in baseline_results:

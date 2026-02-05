@@ -19,29 +19,38 @@ export MASTER_PORT=12368
 
 export TORCH_COMPILE_DISABLE=1
 export TORCHDYNAMO_DISABLE=1
-# export WANDB_MODE=disabled
-
+export WANDB_PROJECT="pure-grpo"
 
 # 运行命令
 cd /data/sjc4fq/ColdRec/AmazonReviews2023
 
 PARALLEL_SIZE=1
-export CUDA_VISIBLE_DEVICES=4,5,6,7
-# export CUDA_VISIBLE_DEVICES=0,1,2,3
-models="LightGCN ItemKNN BPR"
-# echo "================================================"
-# echo "Running Pure Classification Training: Generate SFT Data"
-# echo "================================================"
-# python GRPO/models/main_pure.py \
-#     --gen_sft_data \
-#     --dataset $1 \
-#     --data_path dataset \
-#     --model_name Qwen/Qwen2.5-0.5B-Instruct \
-#     --output_dir GRPO/data/pure_models \
-#     --recbole_models $models \
-#     --final_k 50 \
-#     --profile_cutoff 20 \
-#     --seed 42
+# export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+models="LightGCN SASRec"
+final_k=50
+model_name=meta-llama/Llama-3.2-1B-Instruct
+profile_cutoff=20
+
+echo "================================================"
+echo "Generating pure SFT data..."
+echo "================================================"
+python GRPO/models/main_pure.py \
+    --dataset $1 \
+    --data_path dataset \
+    --checkpoint_dir ./checkpoints \
+    --output_dir GRPO/data/pure_models \
+    --model_name $model_name \
+    --recbole_models $models\
+    --gen_sft_test \
+    --final_k $final_k \
+    --seed 42 \
+    --padding_side left \
+    --random_history_selection \
+    --profile_cutoff $profile_cutoff \
+    --gen_sft_train \
+    --gen_sft_eval \
+    --gen_sft_test \
 
 # echo "================================================"
 # echo "Running Pure Classification Training: SFT"
@@ -51,7 +60,7 @@ models="LightGCN ItemKNN BPR"
 #     --do_sft \
 #     --dataset $1 \
 #     --data_path dataset \
-#     --model_name Qwen/Qwen2.5-0.5B-Instruct \
+#     --model_name $model_name \
 #     --output_dir GRPO/data/pure_models \
 #     --recbole_models $models \
 #     --num_train_epochs 3 \
@@ -63,7 +72,7 @@ models="LightGCN ItemKNN BPR"
 #     --save_steps 500 \
 #     --eval_steps 500 \
 #     --max_length 1536 \
-#     --final_k 50 \
+#     --final_k $final_k \
 # #     --padding_side left \
 #     --seed 42
 
@@ -76,10 +85,10 @@ models="LightGCN ItemKNN BPR"
 #     --do_grpo \
 #     --dataset $1 \
 #     --data_path dataset \
-#     --model_name Qwen/Qwen2.5-0.5B-Instruct \
+#     --model_name $model_name \
 #     --output_dir GRPO/data/pure_models \
 #     --recbole_models $models \
-#     --final_k 50 \
+#     --final_k $final_k \
 #     --logging_steps 10 \
 #     --save_steps 500 \
 #     --tau_gumbel 1.0 \
@@ -99,10 +108,10 @@ accelerate launch --config_file GRPO/configs/soft_acc.yaml \
     --do_grpo \
     --dataset $1 \
     --data_path dataset \
-    --model_name meta-llama/Llama-3.2-1B-Instruct \
+    --model_name $model_name \
     --output_dir GRPO/data/pure_models \
     --recbole_models $models \
-    --final_k 50 \
+    --final_k $final_k \
     --logging_steps 10 \
     --save_steps 500 \
     --tau_gumbel 1.0 \
@@ -111,12 +120,32 @@ accelerate launch --config_file GRPO/configs/soft_acc.yaml \
     --epsilon 0.2 \
     --beta 0.1 \
     --sync_ref_model \
+    --merge_method top_k \
     --ref_model_sync_steps 500 \
     --num_generations 8 \
     --grpo_lr 1e-5 \
     --grpo_epochs 1 \
     --per_device_train_batch_size 2 \
     --gradient_accumulation_steps 1 \
+    --bf16 \
     --seed 42
+
+echo "================================================" 
+echo "Testing pure SFT model..."
+echo "================================================"
+python GRPO/models/main_pure.py \
+    --dataset $1 \
+    --data_path dataset \
+    --checkpoint_dir ./checkpoints \
+    --output_dir GRPO/data/pure_models \
+    --model_name $model_name \
+    --recbole_models $models\
+    --do_test_grpo \
+    --final_k $final_k \
+    --seed 42 \
+    --padding_side left \
+    --random_history_selection \
+    --profile_cutoff $profile_cutoff \
+    --merge_method top_k    
 
 

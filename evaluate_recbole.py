@@ -1,4 +1,8 @@
 # Import all required libraries
+import warnings
+# Suppress pandas FutureWarning from recbole
+warnings.filterwarnings('ignore', category=FutureWarning, message='.*A value is trying to be set on a copy of a DataFrame.*')
+
 import torch
 from datasets import load_dataset
 from recbole.config import Config

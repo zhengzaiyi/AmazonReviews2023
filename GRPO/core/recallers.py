@@ -2,6 +2,10 @@ from typing import Dict, List, Optional, Union
 import os
 import torch
 import numpy as np
+import warnings
+# Suppress pandas FutureWarning from recbole
+warnings.filterwarnings('ignore', category=FutureWarning, message='.*A value is trying to be set on a copy of a DataFrame.*')
+
 from recbole.quick_start.quick_start import load_data_and_model
 
 from .data import InteractionData, get_base_config_dict
