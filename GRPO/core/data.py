@@ -5,6 +5,7 @@ import torch
 import os
 import copy
 import warnings
+from tqdm import tqdm
 # Suppress pandas FutureWarning from recbole
 warnings.filterwarnings('ignore', category=FutureWarning, message='.*A value is trying to be set on a copy of a DataFrame.*')
 
@@ -216,6 +217,9 @@ def load_dataset(
         InteractionData with train/eval/test splits
     """
     config_dict = get_base_config_dict(dataset, data_path, seed, train_ratio, eval_ratio, test_ratio)
+    # Disable caching to ensure fresh data processing (avoids stale float32 data)
+    config_dict['save_dataset'] = False
+    config_dict['save_dataloaders'] = False
     model = 'SASRec'
     cfg = Config(
         model=model, 
@@ -228,6 +232,12 @@ def load_dataset(
     print(ds)
     raw_ds = copy.deepcopy(ds)
     train, valid, test = data_preparation(cfg, ds)
+
+    # Verify float64 timestamp precision
+    _tf = raw_ds.time_field
+    _tl = f'{_tf}_list'
+    _sample_ts = train.dataset.inter_feat[_tl][0][:3].tolist()
+    print(f"[DTYPE CHECK] {_tl} dtype={train.dataset.inter_feat[_tl].dtype}, sample={_sample_ts}")
 
     uid_field, iid_field = ds.uid_field, ds.iid_field
     iid_list_field = f'{iid_field}_list'

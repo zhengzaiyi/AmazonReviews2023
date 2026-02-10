@@ -130,9 +130,9 @@ def create_sft_dataset(
             recaller_top_items = {}  # Store top 3 items for each recaller
             best_ndcg, best_recaller = -1, None
             for recaller_name, recaller in recallers.items():
-                items = recaller.recall(uid, final_k, hist, full_hist=hist + gt_items, gt_items=gt_items)
+                items = recaller.recall(uid, 5, hist, full_hist=hist + gt_items, gt_items=gt_items)
                 item_ids = [item[0] for item in items] if items else []
-                ndcg = ndcg_at_k(item_ids, gt_items, k=final_k)
+                ndcg = ndcg_at_k(item_ids, gt_items, k=5)
                 metrics[recaller_name]["ndcg"].append(ndcg)
                 recaller_scores[recaller_name] = ndcg
                 # Store top 3 items with their metadata (same format as history)

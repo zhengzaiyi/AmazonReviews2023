@@ -73,6 +73,9 @@ generate_combinations() {
     local start_idx=$1
     local remaining_k=$2
     local current_combo_str="$3"
+    local i
+    local max_idx
+    local new_combo_str
     
     if [ $remaining_k -eq 0 ]; then
         # 组合完成，添加到全局数组
@@ -80,12 +83,12 @@ generate_combinations() {
         return
     fi
     
-    local max_idx=$((TOTAL_RECALLERS - remaining_k))
+    max_idx=$((TOTAL_RECALLERS - remaining_k))
     for ((i=$start_idx; i<=$max_idx; i++)); do
         if [ -z "$current_combo_str" ]; then
-            local new_combo_str="${ALL_RECALLERS[$i]}"
+            new_combo_str="${ALL_RECALLERS[$i]}"
         else
-            local new_combo_str="$current_combo_str ${ALL_RECALLERS[$i]}"
+            new_combo_str="$current_combo_str ${ALL_RECALLERS[$i]}"
         fi
         generate_combinations $((i+1)) $((remaining_k-1)) "$new_combo_str"
     done

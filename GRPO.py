@@ -6,7 +6,7 @@ This file calls into the refactored GRPO.main module. The original monolithic
 script was split into submodules under `GRPO/` for clarity.
 """
 
-from GRPO import main as _main
+from GRPO.models import main as _main
 
 
 def main():
