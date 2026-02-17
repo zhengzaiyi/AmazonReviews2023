@@ -6,6 +6,11 @@ import warnings
 # Suppress pandas FutureWarning from recbole
 warnings.filterwarnings('ignore', category=FutureWarning, message='.*A value is trying to be set on a copy of a DataFrame.*')
 
+# Fix compatibility: scipy >= 1.14 removed dok_matrix._update that recbole depends on
+from scipy.sparse import dok_matrix as _dok_matrix
+if not hasattr(_dok_matrix, '_update'):
+    _dok_matrix._update = _dok_matrix.update
+
 from recbole.quick_start.quick_start import load_data_and_model
 
 from .data import InteractionData, get_base_config_dict
@@ -62,6 +67,7 @@ class RecBoleRecaller(BaseRecaller):
         if self.model_name == 'BPR':
             model_config = {
                 **base_config,
+                'epochs': 100,
                 'train_neg_sample_args': {
                     'distribution': 'uniform',
                     'sample_num': 1,
@@ -79,6 +85,7 @@ class RecBoleRecaller(BaseRecaller):
         elif self.model_name == 'SASRec':
             model_config = {
                 **base_config,
+                'epochs': 100,
                 'train_neg_sample_args': None,
                 'loss_type': 'CE',
                 'learning_rate': 0.001,
@@ -115,6 +122,7 @@ class RecBoleRecaller(BaseRecaller):
         elif self.model_name == 'FPMC':
             model_config = {
                 **base_config,
+                'epochs': 100,
                 'train_neg_sample_args': {
                     'distribution': 'uniform',
                     'sample_num': 1
@@ -127,6 +135,7 @@ class RecBoleRecaller(BaseRecaller):
         elif self.model_name == 'GRU4Rec':
             model_config = {
                 **base_config,
+                'epochs': 100,
                 'train_neg_sample_args': None,
                 'loss_type': 'CE',
                 'embedding_size': 64,
@@ -138,6 +147,7 @@ class RecBoleRecaller(BaseRecaller):
         elif self.model_name == 'LightGCN':
             model_config = {
                 **base_config,
+                'epochs': 100,
                 'train_neg_sample_args': {
                     'distribution': 'uniform',
                     'sample_num': 1,
@@ -153,6 +163,7 @@ class RecBoleRecaller(BaseRecaller):
         elif self.model_name == 'SimpleX':
             model_config = {
                 **base_config,
+                'epochs': 100,
                 'train_neg_sample_args': {
                     'distribution': 'uniform',
                     'sample_num': 1,
@@ -172,6 +183,7 @@ class RecBoleRecaller(BaseRecaller):
             # Default configuration for other models
             model_config = {
                 **base_config,
+                'epochs': 100,
                 'train_neg_sample_args': {
                     'distribution': 'uniform',
                     'sample_num': 1

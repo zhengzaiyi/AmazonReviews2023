@@ -20,18 +20,18 @@ def create_recaller(model_name: str, dataset_name: str, checkpoint_dir: str, dat
         os.makedirs(checkpoint_path)
 
     
-    # Model-specific configurations
+    # Model-specific configurations (epochs: 100 for trainable models; main_pure uses this via config_dict.update)
     model_configs = {
         'BPR': {
             'seed': seed,
-            'epochs': 20,
+            'epochs': 100,
             'learning_rate': 0.001,
             'embedding_size': 64,
             'train_batch_size': 2048,
         },
         'SASRec': {
             'seed': seed,
-            'epochs': 20,
+            'epochs': 100,
             'learning_rate': 0.001,
             'hidden_size': 64,
             'max_seq_length': 50,
@@ -48,17 +48,25 @@ def create_recaller(model_name: str, dataset_name: str, checkpoint_dir: str, dat
         },
         'FPMC': {
             'seed': seed,
-            'epochs': 20,
+            'epochs': 100,
             'learning_rate': 0.001,
             'embedding_size': 64,
         },
         'GRU4Rec': {
             'seed': seed,
-            'epochs': 20,
+            'epochs': 100,
             'learning_rate': 0.001,
             'embedding_size': 64,
             'hidden_size': 128,
-        }
+        },
+        'LightGCN': {
+            'seed': seed,
+            'epochs': 100,
+        },
+        'SimpleX': {
+            'seed': seed,
+            'epochs': 100,
+        },
     }
     
     # Get configuration for the specific model
@@ -84,12 +92,14 @@ def initialize_recallers(
     recallers = {}
     failed_models = []
     
-    # Supported models in RecBole
+    # Supported models in RecBole (with correct casing)
     supported_models = ['BPR', 'SASRec', 'Pop', 'ItemKNN', 'FPMC', 'GRU4Rec', 'LightGCN', 'SimpleX']
+    # Case-insensitive mapping to correct model names
+    model_name_map = {m.lower(): m for m in supported_models}
     
     for model_name in model_names:
-        # Normalize model name
-        normalized_name = model_name.upper() if model_name.upper() in supported_models else model_name
+        # Normalize model name (case-insensitive lookup)
+        normalized_name = model_name_map.get(model_name.lower(), model_name)
         
         # Handle legacy model name mappings
         if model_name.lower() == 'itemcf':

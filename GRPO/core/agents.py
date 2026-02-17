@@ -142,8 +142,37 @@ class UserProfileAgent:
     def _get_item_metadata(self, item_id: int):
         return self.id2meta[str(item_id)]
 
+    @staticmethod
+    def _format_relative_time(seconds_diff):
+        """将秒数差值转换为相对时间字符串（只显示最大单位）"""
+        if seconds_diff < 0:
+            return "in the future"
+        
+        minutes = seconds_diff / 60
+        hours = minutes / 60
+        days = hours / 24
+        weeks = days / 7
+        months = days / 30
+        years = days / 365
+        
+        if years >= 1:
+            return f"{int(years)} year{'s' if years >= 2 else ''} ago"
+        elif months >= 1:
+            return f"{int(months)} month{'s' if months >= 2 else ''} ago"
+        elif weeks >= 1:
+            return f"{int(weeks)} week{'s' if weeks >= 2 else ''} ago"
+        elif days >= 1:
+            return f"{int(days)} day{'s' if days >= 2 else ''} ago"
+        elif hours >= 1:
+            return f"{int(hours)} hour{'s' if hours >= 2 else ''} ago"
+        elif minutes >= 1:
+            return f"{int(minutes)} minute{'s' if minutes >= 2 else ''} ago"
+        else:
+            return "just now"
+
     def forward(self, user_id: int, history: List[int], cut_off: int = 5, use_meta_data: bool = False, 
-                include_recaller_metrics: bool = False, available_recallers: List[str] = None):
+                include_recaller_metrics: bool = False, available_recallers: List[str] = None,
+                reference_timestamp: float = None):
         if 0 in history:
             history = history[:history.index(0)]
         if len(history) > cut_off:
@@ -192,7 +221,12 @@ class UserProfileAgent:
                     if ts > 1e12:  # Milliseconds (e.g., 1609459200000)
                         ts = ts / 1000
                     if ts > 86400:  # Reasonable Unix timestamp (after 2001)
-                        hist_item['timestamp'] = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+                        if reference_timestamp:
+                            # 计算相对于参考时间的差值
+                            diff = reference_timestamp - ts
+                            hist_item['timestamp'] = self._format_relative_time(diff)
+                        else:
+                            hist_item['timestamp'] = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
                     else:
                         # Invalid timestamp (e.g., 0 -> 1970), mark as unknown
                         hist_item['timestamp'] = 'unknown'

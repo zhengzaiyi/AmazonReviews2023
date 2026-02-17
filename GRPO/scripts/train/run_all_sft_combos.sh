@@ -43,7 +43,7 @@ fi
 DATASET=$1
 GPU_IDS_STR=$2
 COMBO_SIZE=${3:-3}
-SESSION_NAME=${4:-sft_combos1}
+SESSION_NAME=${4:-sft_combos}
 
 # 检查pure_sft.sh是否存在
 if [ ! -f "$PURE_SFT_SCRIPT" ]; then
@@ -61,7 +61,7 @@ if [ $NUM_GPUS -eq 0 ]; then
 fi
 
 # 定义所有可用的recallers
-ALL_RECALLERS=("BPR" "SASRec" "ItemKNN" "LightGCN" "Pop")
+ALL_RECALLERS=("BPR" "SASRec" "ItemKNN" "LightGCN" "Pop" "SASRec")
 TOTAL_RECALLERS=${#ALL_RECALLERS[@]}
 
 # 验证组合大小
@@ -156,7 +156,7 @@ for ((c=0; c<$TOTAL_COMBOS; c++)); do
     # 在tmux中新建窗口并运行pure_sft.sh
     tmux new-window -t "$SESSION_NAME" -n "$window_name"
     tmux send-keys -t "$SESSION_NAME:$window_name" \
-        "echo '=== Combo $((c+1))/$TOTAL_COMBOS: $combo (GPU $gpu_id) ===' && bash $PURE_SFT_SCRIPT $DATASET $gpu_id \"$combo\"" \
+        "echo '=== Combo $((c+1))/$TOTAL_COMBOS: $combo (GPU $gpu_id) ===' && p bash $PURE_SFT_SCRIPT $DATASET $gpu_id \"$combo\"" \
         Enter
 done
 

@@ -132,10 +132,18 @@ def build_prompt(profile_json: str, available_models: List[str] = None, type: st
         return (
             "You are an assistant in a recommendation system. Given a user profile, "
             "output ONLY the best recaller model name from the available models."
+            f"User Profile:\n{profile_json}\n"
             f"Available models: \n{[json.dumps(m, indent=2) for m in available_models]}\n"
+            "Your response:"
+        )
+
+    elif type == 'instruction':
+        return (
+            "You are an assistant in a recommendation system. Given a user profile, "
+            "output ONLY the best recaller model name from the available models."
             f"User Profile:\n{profile_json}\n"
             f"Available models: \n{[m for m in available_models]}\n"
-            "Your response:"
+            f"Your response (only output the best recaller model name from {available_models}, no other text):"
         )
 
 

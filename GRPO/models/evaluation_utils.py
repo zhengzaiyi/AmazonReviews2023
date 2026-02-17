@@ -161,6 +161,56 @@ def find_best_base_model(
     return best_name, best_value
 
 
+def compute_performance_gaps(
+    results: Dict[str, Dict[str, float]],
+    recaller_names: List[str],
+    eval_k: int,
+    method_keys: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Compute NDCG/Recall gaps vs best base for given methods.
+    results: aggregated metrics (method -> {ndcg@k, recall@k}); must include base recaller names.
+    Returns dict with eval_k, best_base_ndcg, best_base_recall, and per method_key: ndcg_gap_vs_best_base, recall_gap_vs_best_base.
+    """
+    method_keys = method_keys or ["single_select", "multi_channel"]
+    gap_k = eval_k if eval_k in [10, 20, 50] else 50
+    ndcg_key = f"ndcg@{gap_k}"
+    recall_key = f"recall@{gap_k}"
+    best_base_ndcg = max(results.get(r, {}).get(ndcg_key, 0) for r in recaller_names)
+    best_base_recall = max(results.get(r, {}).get(recall_key, 0) for r in recaller_names)
+    out = {
+        "eval_k": gap_k,
+        "best_base_ndcg": best_base_ndcg,
+        "best_base_recall": best_base_recall,
+    }
+    for key in method_keys:
+        m = results.get(key, {})
+        out[key] = {
+            "ndcg_gap_vs_best_base": m.get(ndcg_key, 0) - best_base_ndcg,
+            "recall_gap_vs_best_base": m.get(recall_key, 0) - best_base_recall,
+        }
+    return out
+
+
+def print_performance_gaps(
+    performance_gaps: Dict[str, Any],
+    method_labels: Optional[Dict[str, str]] = None,
+) -> None:
+    """Print a compact 'Performance Gaps vs Best Base' section."""
+    method_labels = method_labels or {"single_select": "Single", "multi_channel": "Multi-Ch"}
+    gap_k = performance_gaps.get("eval_k", 50)
+    best_ndcg = performance_gaps.get("best_base_ndcg", 0)
+    best_recall = performance_gaps.get("best_base_recall", 0)
+    print(f"\n--- Gaps vs Best Base (k={gap_k}) | NDCG@{gap_k}={best_ndcg:.4f} Recall@{gap_k}={best_recall:.4f} ---")
+    for key, label in method_labels.items():
+        g = performance_gaps.get(key, {})
+        if not g:
+            continue
+        ndcg_g = g.get("ndcg_gap_vs_best_base", 0)
+        rec_g = g.get("recall_gap_vs_best_base", 0)
+        print(f"  {label}: NDCG {ndcg_g:+.4f}  Recall {rec_g:+.4f}")
+
+
 def print_comparison_table(
     results: Dict[str, Dict[str, float]],
     recaller_names: List[str],
@@ -233,3 +283,47 @@ def print_comparison_table(
                 
                 row = " ".join([f"{part:>12}" for part in row_parts])
                 print(row)
+
+
+def print_cross_checkpoint_table(
+    all_multi_results: Dict[str, Dict[str, Dict[str, float]]],
+    recaller_names: List[str],
+):
+    """
+    Print a comparison table across multiple checkpoints (e.g., SFT vs GRPO).
+    Each checkpoint contributes Single and Multi-Ch columns.
+    
+    Args:
+        all_multi_results: Dict mapping checkpoint_name -> multi_channel evaluation results
+        recaller_names: List of base recaller names
+    """
+    ckpt_names = list(all_multi_results.keys())
+    
+    print("\n" + "="*60)
+    print(f"Cross-Checkpoint Comparison ({' vs '.join(n.upper() for n in ckpt_names)})")
+    print("="*60)
+    
+    # Build header: Metric | <ckpt>-Single <ckpt>-Multi ... | Best Base
+    col_w = 12
+    header = f"{'Metric':<{col_w}}"
+    for name in ckpt_names:
+        header += f" {name.upper()+'-Sing':>{col_w}} {name.upper()+'-Multi':>{col_w}}"
+    header += f" {'Best Base':>{col_w}}"
+    print(header)
+    print("-" * len(header))
+    
+    for k in [10, 20, 50]:
+        for metric in ['ndcg', 'recall']:
+            key = f"{metric}@{k}"
+            row = f"{key:<{col_w}}"
+            for name in ckpt_names:
+                res = all_multi_results[name]
+                single = res.get("single_select", {}).get(key, 0)
+                multi = res.get("multi_channel", {}).get(key, 0)
+                row += f" {single:>{col_w}.4f} {multi:>{col_w}.4f}"
+            best_base = max(
+                all_multi_results[ckpt_names[0]].get(rn, {}).get(key, 0)
+                for rn in recaller_names
+            )
+            row += f" {best_base:>{col_w}.4f}"
+            print(row)
