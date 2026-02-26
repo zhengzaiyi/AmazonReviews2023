@@ -106,4 +106,15 @@ dataset_feat_alias = {
     'Amazon_All_Beauty': {},
 }
 
+dataset_rating_scale = {
+    'ml-1m': 5,
+    'ml-10m': 5,
+    'yelp2022': 5,
+    'Food': 5,
+    'Amazon_Toys_and_Games': 5,
+    'Amazon_Musical_Instruments': 5,
+    'Amazon_Books': 5,
+    'Amazon_All_Beauty': 5,
+}
+
 # TODO: add reviews, etc.

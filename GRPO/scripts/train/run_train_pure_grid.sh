@@ -6,29 +6,37 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_SCRIPT="$SCRIPT_DIR/train_pure.sh"
-SESSION_NAME="true_llama_ml_steam"
+SESSION_NAME="Food_re"
 
 # =============================================================================
 # 在这里手动配置三个列表
 # =============================================================================
 datasets=(
-    "ml-1m"
-    "steam"
+    # "ml-1m"
+    # "steam"
     # "Amazon_Books"
-    # "Food"
+    "Food"
 )
 
 combinations=(
-    "LightGCN ItemKNN Pop"
-    "BPR SASRec LightGCN"
+    "ItemKNN LightGCN Pop"
+    # "EASE RecVAE SLIMElastic NeuMF"
+    # "BPR SASRec LightGCN"
     # "SASRec ItemKNN LightGCN"
 )
 
 model_names=(
     "meta-llama/Llama-3.2-1B-Instruct"
     # "Qwen/Qwen2.5-0.5B-Instruct"
-    # "Qwen/Qwen3-4B-Instruct-2507"
+    "Qwen/Qwen3-4B-Instruct-2507"
 )
+
+get_max_length() {
+    case "$1" in
+        Food) echo 11024 ;;
+        *)    echo 1536 ;;
+    esac
+}
 
 # =============================================================================
 # 启动
@@ -67,11 +75,12 @@ for dataset in "${datasets[@]}"; do
             window_name="${window_name//[-.]/_}"
             window_name="${window_name:0:60}"
 
-            echo "[$((counter+1))/$total] $window_name (port $port, DATA_EVAL_GPU=$data_eval_gpu)"
+            ml=$(get_max_length "$dataset")
+            echo "[$((counter+1))/$total] $window_name (port $port, DATA_EVAL_GPU=$data_eval_gpu, MAX_LENGTH=$ml)"
 
             tmux new-window -t "$SESSION_NAME" -n "$window_name"
             tmux send-keys -t "$SESSION_NAME:$window_name" \
-                "export TRAIN_MODELS='$combo' TRAIN_MODEL_NAME='$model' MASTER_PORT=$port DATA_EVAL_GPU=$data_eval_gpu && source ~/.bashrc && conda activate pp && p bash $TRAIN_SCRIPT $dataset" \
+                "export TRAIN_MODELS='$combo' TRAIN_MODEL_NAME='$model' MASTER_PORT=$port DATA_EVAL_GPU=$data_eval_gpu MAX_LENGTH=$ml && source ~/.bashrc && conda activate pp && p bash $TRAIN_SCRIPT $dataset" \
                 Enter
 
             counter=$((counter + 1))

@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field, create_model
 from typing import Dict, List, Type
 from GRPO.core.data import InteractionData
 from recbole.data.dataset import SequentialDataset
-from GRPO.core.constant import dataset_feat_alias
+from GRPO.core.constant import dataset_feat_alias, dataset_rating_scale
 
 
 class UserProfileAgent:
@@ -213,26 +213,31 @@ class UserProfileAgent:
                             else:
                                 user_profile_dict['purchase history'][i]['best_recaller'] = pm.get('best_recaller', 'unknown')
                
-        for hist_item in user_profile_dict['purchase history']:
-            if 'timestamp' in hist_item.keys():
-                ts = hist_item['timestamp']
-                # Handle various timestamp formats
-                try:
-                    if ts > 1e12:  # Milliseconds (e.g., 1609459200000)
-                        ts = ts / 1000
-                    if ts > 86400:  # Reasonable Unix timestamp (after 2001)
-                        if reference_timestamp:
-                            # 计算相对于参考时间的差值
-                            diff = reference_timestamp - ts
-                            hist_item['timestamp'] = self._format_relative_time(diff)
-                        else:
-                            hist_item['timestamp'] = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+        def _format_timestamp_field(hist_item, field_name, reference_timestamp):
+            if field_name not in hist_item:
+                return
+            ts = hist_item[field_name]
+            try:
+                ts = float(ts)
+                if ts > 1e12:
+                    ts = ts / 1000
+                if ts > 86400:
+                    if reference_timestamp:
+                        diff = reference_timestamp - ts
+                        hist_item[field_name] = self._format_relative_time(diff)
                     else:
-                        # Invalid timestamp (e.g., 0 -> 1970), mark as unknown
-                        hist_item['timestamp'] = 'unknown'
-                except (ValueError, OSError, OverflowError):
-                    # Invalid timestamp, mark as unknown
-                    hist_item['timestamp'] = 'unknown'
+                        hist_item[field_name] = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+                else:
+                    hist_item[field_name] = 'unknown'
+            except (ValueError, OSError, OverflowError, TypeError):
+                hist_item[field_name] = 'unknown'
+        
+        max_rating = dataset_rating_scale.get(self.dataset_name, 5)
+        for hist_item in user_profile_dict['purchase history']:
+            if 'rating' in hist_item:
+                hist_item['rating'] = f"{hist_item['rating']}/{max_rating}"
+            _format_timestamp_field(hist_item, 'timestamp', reference_timestamp)
+            _format_timestamp_field(hist_item, 'submitted_timestamp', reference_timestamp)
         
         # Convert numpy types to Python native types for yaml serialization
         def convert_numpy(obj):

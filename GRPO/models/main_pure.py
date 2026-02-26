@@ -110,12 +110,13 @@ def create_sft_dataset(
     
     dataset = []
     metrics = {recaller: defaultdict(list) for recaller in recallers.keys()}
-    
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+
     # Create label mappings
     recaller_names = sorted(list(recallers.keys()))
     label2id = {name: i for i, name in enumerate(recaller_names)}
     id2label = {i: name for name, i in label2id.items()}
-    
+    max_token_number = 0
     for i, uid in tqdm(enumerate(user_ids)):
         hist = histories[i]
         gt_items = target_items[i]
@@ -153,9 +154,10 @@ def create_sft_dataset(
                 ndcg = ndcg_at_k(item_ids, gt_items, k=train_k)
                 metrics[recaller_name]["ndcg"].append(ndcg)
                 recaller_scores[recaller_name] = ndcg
-                # Store top items with their metadata (same format as history)
+                # Store top items with their metadata and rank
                 recaller_top_items[recaller_name] = [
-                    profile_agent.item_feat.get(iid, {}) for iid in item_ids[:prompt_top_k]
+                    {"rank": idx + 1, **profile_agent.item_feat.get(iid, {})} 
+                    for idx, iid in enumerate(item_ids[:prompt_top_k])
                 ]
                 
                 if ndcg > best_ndcg:
@@ -196,33 +198,25 @@ def create_sft_dataset(
             else:
                 hint = ""
             
-            # Build available models description with top 3 retrieved items
-            models_with_items = []
-            for m in recaller_names:
-                desc = TOOLS_DESCRIPTION.get(m.lower(), {}).get("description", "")
-                top_items = recaller_top_items.get(m, [])
-                models_with_items.append({
+            # Build available models description with top retrieved items
+            models_with_items = [
+                {
                     "name": m,
-                    "description": desc,
+                    "description": TOOLS_DESCRIPTION.get(m.lower(), {}).get("description", ""),
                     "when_to_use": TOOLS_DESCRIPTION.get(m.lower(), {}).get("when_to_use", "depends on the user profile and interaction history."),
-                    "top_retrieved_items": top_items
-                })
+                    "top_retrieved_items": recaller_top_items.get(m, [])
+                }
+                for m in recaller_names
+            ]
             
-            base_prompt = build_prompt(user_profile, available_models=recaller_names, type=prompt_type)
-            # Replace the simple available models list with detailed description
-            models_str = "\n".join([
-                f"- {m['name']}: {m['description']}. When to use: {m['when_to_use']}\n  Top retrieved items: {json.dumps(m['top_retrieved_items'], ensure_ascii=False)}"
-                for m in models_with_items
-            ])
-            base_prompt = base_prompt.replace(
-                f"Available models: \n{[m for m in recaller_names]}\n",
-                f"Available models:\n{models_str}\n"
+            prompt = build_prompt(
+                user_profile, 
+                available_models=recaller_names,
+                models_with_items=models_with_items,
+                hint=hint if hint else None,
+                type=prompt_type
             )
-            if hint:
-                prompt = base_prompt.replace("Your response:", f"\nNote: Based on this user's historical interactions, {hint} has shown the best performance.\nYour response:")
-            else:
-                prompt = base_prompt
-            
+            max_token_number = max(max_token_number, tokenizer(prompt, return_tensors="pt").input_ids.shape[1])
             sample = {
                 "text": prompt,
                 "prompt": prompt,  # For GRPO compatibility
@@ -482,14 +476,13 @@ def compute_metrics_seq2seq(eval_pred, tokenizer, label2id):
     }
 
 
-def evaluate_pure_model(model, tokenizer, test_dataset, id2label, recallers=None, eval_k=50, use_chat_format=False):
+def evaluate_pure_model(model, tokenizer, test_dataset, id2label, recallers=None, eval_k=50, use_chat_format=False, max_length=1536):
     """Evaluate the pure classification model and generate recommendations"""
     device = model.device
     model.eval()
     
     all_predictions, all_labels = [], []
     recommendation_results = []
-    
     with torch.no_grad():
         for idx, example in enumerate(tqdm(test_dataset, desc="Evaluating")):
             text = example["text"]
@@ -498,7 +491,7 @@ def evaluate_pure_model(model, tokenizer, test_dataset, id2label, recallers=None
                 text = apply_chat_format([text], tokenizer)[0]
             
             inputs = tokenizer(text, return_tensors="pt", truncation=True, 
-                             max_length=1536, padding=True)
+                             max_length=max_length)
             inputs = {k: v.to(device) for k, v in inputs.items()}
             
             outputs = model(**inputs)
@@ -749,6 +742,7 @@ def evaluate_multi_channel_recall(
     score_norm_kwargs: Optional[dict] = None,
     id2label: Optional[Dict[int, str]] = None,
     use_chat_format: bool = False,
+    max_length: int = 1536,
 ):
     """
     Evaluate model using multi-channel recall with softmax weights.
@@ -795,7 +789,7 @@ def evaluate_multi_channel_recall(
                 text = apply_chat_format([text], tokenizer)[0]
             
             inputs = tokenizer(text, return_tensors="pt", truncation=True, 
-                             max_length=1536, padding=True)
+                             max_length=max_length)
             inputs = {k: v.to(device) for k, v in inputs.items()}
             
             outputs = model(**inputs)
@@ -1516,14 +1510,15 @@ def main():
             # Check if model is an Instruct model (case insensitive)
             use_chat_format = "instruct" in args.model_name.lower()
             
-            results = evaluate_pure_model(model, tokenizer, test_dataset, id2label, recallers, args.eval_k, use_chat_format=use_chat_format)
+            results = evaluate_pure_model(model, tokenizer, test_dataset, id2label, recallers, args.eval_k, use_chat_format=use_chat_format, max_length=args.max_length)
             multi_results = evaluate_multi_channel_recall(
                 model, tokenizer, test_dataset, recallers, recaller_names,
                 args.eval_k, merge_method=args.merge_method,
                 score_norm=score_norm,
                 score_norm_kwargs=score_norm_kwargs,
                 id2label=id2label,
-                use_chat_format=use_chat_format
+                use_chat_format=use_chat_format,
+                max_length=args.max_length,
             )
             all_multi_results[test_name] = multi_results
             

@@ -105,44 +105,54 @@ TOOLS_DESCRIPTION = {
     }
 }
 
-def build_prompt(profile_json: str, available_models: List[str] = None, type: str = 'json') -> str:
+def build_prompt(
+    profile_json: str, 
+    available_models: List[str] = None, 
+    models_with_items: List[Dict] = None,
+    hint: str = None,
+    type: str = 'json'
+) -> str:
     if available_models is None:
         available_models = ['sasrec', 'bpr', 'pop']
-    models_str = "', '".join(available_models)
-        
-    # Create an example output format
-    import random
-    example_output = {
-        model: {
-            "score-weight": f'float between 0 and 1'
-        } for model in available_models
-    }
-    example_output = json.dumps(example_output, indent=2)
+    
+    # Build models section
+    if models_with_items:
+        models_str = "\n".join([
+            f"- {m['name']}: {m['description']}. When to use: {m['when_to_use']}\n  Top retrieved items: {json.dumps(m['top_retrieved_items'], ensure_ascii=False)}"
+            for m in models_with_items
+        ])
+        models_section = f"Available models:\n{models_str}\n\nTie-breaking rule: If multiple models retrieve the correct item, prefer the one with a higher rank (smaller rank number)."
+    else:
+        models_section = f"Available models: \n{[m for m in available_models]}"
+    
+    # Build hint section
+    hint_section = f"\nNote: Based on this user's historical interactions, {hint} has shown the best performance." if hint else ""
+    
     if type == 'json':
         return (
             "You are a multi-channel recall assistant in a recommendation system. Given a user profile, "
             "output ONLY a JSON file describe the score-weights of different models during the multi-channel recall."
             f"Available models: \n{[json.dumps(TOOLS_DESCRIPTION[m.lower()], indent=2) for m in available_models]}\n"
             f"User Profile:\n{profile_json}\n"
-            # f"Expected output format example:\n{example_output}\n\n"
             f"Please output the JSON file containing the score-weights of ALL available models."
             "Your JSON response:"
         )
     elif type == 'classification':
         return (
             "You are an assistant in a recommendation system. Given a user profile, "
-            "output ONLY the best recaller model name from the available models."
+            "output ONLY the best recaller model name from the available models.\n"
             f"User Profile:\n{profile_json}\n"
-            f"Available models: \n{[json.dumps(m, indent=2) for m in available_models]}\n"
+            f"{models_section}"
+            f"{hint_section}\n"
             "Your response:"
         )
-
     elif type == 'instruction':
         return (
             "You are an assistant in a recommendation system. Given a user profile, "
-            "output ONLY the best recaller model name from the available models."
+            "output ONLY the best recaller model name from the available models.\n"
             f"User Profile:\n{profile_json}\n"
-            f"Available models: \n{[m for m in available_models]}\n"
+            f"{models_section}"
+            f"{hint_section}\n"
             f"Your response (only output the best recaller model name from {available_models}, no other text):"
         )
 

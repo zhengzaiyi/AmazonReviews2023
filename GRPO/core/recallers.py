@@ -179,6 +179,75 @@ class RecBoleRecaller(BaseRecaller):
                 'train_batch_size': 2048,
                 'eval_batch_size': 2048 * 20000,
             }
+        elif self.model_name == 'RaCT':
+            model_config = {
+                **base_config,
+                'epochs': 100,
+                'train_neg_sample_args': None,
+                'latent_dimension': 64,
+                'mlp_hidden_size': [600],
+                'dropout_prob': 0.5,
+                'anneal_cap': 0.2,
+                'total_anneal_steps': 200000,
+                'critic_layers': [100, 1],
+                'beta': 0.2,
+                'learning_rate': 0.001,
+                'train_batch_size': 512,
+                'eval_batch_size': 512,
+            }
+        elif self.model_name == 'EASE':
+            model_config = {
+                **base_config,
+                'train_neg_sample_args': None,
+                'epochs': 1,
+                'reg_weight': 250.0,
+            }
+        elif self.model_name == 'RecVAE':
+            model_config = {
+                **base_config,
+                'epochs': 100,
+                'train_neg_sample_args': None,
+                'hidden_dimension': 600,
+                'latent_dimension': 64,
+                'dropout_prob': 0.5,
+                'beta': None,
+                'gamma': 0.005,
+                'mixture_weights': [0.15, 0.75, 0.1],
+                'n_enc_epochs': 3,
+                'n_dec_epochs': 1,
+                'learning_rate': 0.001,
+                'train_batch_size': 512,
+                'eval_batch_size': 512,
+            }
+        elif self.model_name == 'SLIMElastic':
+            model_config = {
+                **base_config,
+                'train_neg_sample_args': None,
+                'epochs': 1,
+                'alpha': 0.2,
+                'l1_ratio': 0.02,
+                'positive_only': True,
+                'hide_item': False,
+            }
+        elif self.model_name == 'NeuMF':
+            model_config = {
+                **base_config,
+                'epochs': 100,
+                'train_neg_sample_args': {
+                    'distribution': 'uniform',
+                    'sample_num': 1,
+                },
+                'loss_type': 'BCE',
+                'mf_embedding_size': 64,
+                'mlp_embedding_size': 64,
+                'mlp_hidden_size': [128, 64],
+                'dropout_prob': 0.1,
+                'mf_train': True,
+                'mlp_train': True,
+                'learning_rate': 0.001,
+                'train_batch_size': 2048,
+                'eval_batch_size': 2048,
+            }
         else:
             # Default configuration for other models
             model_config = {

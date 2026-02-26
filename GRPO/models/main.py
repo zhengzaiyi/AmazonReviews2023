@@ -67,6 +67,34 @@ def create_recaller(model_name: str, dataset_name: str, checkpoint_dir: str, dat
             'seed': seed,
             'epochs': 100,
         },
+        'RaCT': {
+            'seed': seed,
+            'epochs': 100,
+            'latent_dimension': 64,
+            'learning_rate': 0.001,
+        },
+        'EASE': {
+            'seed': seed,
+            'reg_weight': 250.0,
+        },
+        'RecVAE': {
+            'seed': seed,
+            'epochs': 100,
+            'latent_dimension': 64,
+            'learning_rate': 0.001,
+        },
+        'SLIMElastic': {
+            'seed': seed,
+            'alpha': 0.2,
+            'l1_ratio': 0.02,
+        },
+        'NeuMF': {
+            'seed': seed,
+            'epochs': 100,
+            'mf_embedding_size': 64,
+            'mlp_embedding_size': 64,
+            'learning_rate': 0.001,
+        },
     }
     
     # Get configuration for the specific model
@@ -93,7 +121,7 @@ def initialize_recallers(
     failed_models = []
     
     # Supported models in RecBole (with correct casing)
-    supported_models = ['BPR', 'SASRec', 'Pop', 'ItemKNN', 'FPMC', 'GRU4Rec', 'LightGCN', 'SimpleX']
+    supported_models = ['BPR', 'SASRec', 'Pop', 'ItemKNN', 'FPMC', 'GRU4Rec', 'LightGCN', 'SimpleX', 'RaCT', 'EASE', 'RecVAE', 'SLIMElastic', 'NeuMF']
     # Case-insensitive mapping to correct model names
     model_name_map = {m.lower(): m for m in supported_models}
     

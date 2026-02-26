@@ -1,5 +1,5 @@
 #!/bin/bash
-# sleep 14000
+# sleep 21600
 export PYTHONPATH=~/AmazonReviews2023
 
 # DATASET=Musical_Instruments
@@ -20,6 +20,13 @@ export MASTER_PORT=12368
 export TORCH_COMPILE_DISABLE=1
 export TORCHDYNAMO_DISABLE=1
 export WANDB_PROJECT="pure-grpo"
+
+# Dataset-specific max_length (Food has longer prompts due to item features)
+if [ "$1" = "Food" ]; then
+    max_length="${MAX_LENGTH:-11024}"
+else
+    max_length="${MAX_LENGTH:-1536}"
+fi
 
 # 运行命令
 # cd /data/sjc4fq/ColdRec/AmazonReviews2023
@@ -76,7 +83,7 @@ accelerate launch --config_file GRPO/configs/soft_acc.yaml \
     --logging_steps 20 \
     --save_steps 1000 \
     --eval_steps 1000 \
-    --max_length 1536 \
+    --max_length $max_length \
     --train_k $train_k \
     --eval_k $eval_k \
     --seed 42 \
@@ -107,7 +114,7 @@ accelerate launch --config_file GRPO/configs/soft_acc.yaml \
     --logging_steps 20 \
     --save_steps 1000 \
     --eval_steps 1000 \
-    --max_length 1536 \
+    --max_length $max_length \
     --train_k $train_k \
     --eval_k $eval_k \
     --seed 42 \
@@ -141,11 +148,12 @@ accelerate launch --config_file GRPO/configs/soft_acc.yaml \
     --sync_ref_model \
     --merge_method top_k \
     --ref_model_sync_steps 500 \
+    --max_length $max_length \
     --num_generations 8 \
     --grpo_lr 1e-6 \
     --grpo_epochs 1 \
     --per_device_train_batch_size 2 \
-    --gradient_accumulation_steps 4 \
+    --gradient_accumulation_steps 8 \
     --bf16 \
     --seed 42 \
     --profile_cutoff $profile_cutoff
@@ -168,5 +176,6 @@ CUDA_VISIBLE_DEVICES=$DATA_EVAL_GPU python GRPO/models/main_pure.py \
     --padding_side left \
     --random_history_selection \
     --profile_cutoff $profile_cutoff \
-    --merge_method top_k    
+    --merge_method top_k \
+    --max_length $max_length \
 

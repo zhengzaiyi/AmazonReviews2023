@@ -17,7 +17,7 @@ import argparse
 import json
 import os
 import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import torch
 import torch.nn as nn
@@ -672,6 +672,8 @@ def train_pg_model(
     reg_weight: float = 1.0,
     embedding_dim: int = 64,
     device: str = "cuda",
+    min_thres: float = 0.001,
+    train_k: int = 20,
 ):
     """
     Train Policy Gradient model for personalized fusion.
@@ -753,6 +755,22 @@ def train_pg_model(
         recallers=recaller_fns,
         M=M
     )
+    
+    if min_thres > 0:
+        valid_indices = []
+        for u in range(len(user_ids)):
+            best_ndcg = max(
+                ndcg_at_k(user_candidates[u][k][:train_k], list(gt_items_list[u]), train_k)
+                for k in range(K)
+            )
+            if best_ndcg >= min_thres:
+                valid_indices.append(u)
+        n_before = len(user_ids)
+        user_ids = [user_ids[i] for i in valid_indices]
+        eval_hists = [eval_hists[i] for i in valid_indices]
+        gt_items_list = [gt_items_list[i] for i in valid_indices]
+        user_candidates = [user_candidates[i] for i in valid_indices]
+        print(f"Filtered to {len(user_ids)}/{n_before} users (min_thres={min_thres}, train_k={train_k})")
     
     # Extract pre-trained embeddings from recallers (prefer SimpleX as per paper)
     print(f"\nExtracting pre-trained embeddings from recallers...")
@@ -864,6 +882,8 @@ def evaluate_pg_fusion(
     pg_model: PersonalizedFusionPG,
     final_k: int = 50,
     device: str = "cuda",
+    min_thres: float = 0.001,
+    train_k: int = 20,
 ):
     """
     Evaluate PG-optimized fusion on test set.
@@ -892,15 +912,18 @@ def evaluate_pg_fusion(
     gt_items_list = []
     
     for example in test_dataset:
-        user_ids.append(example["user_id"])
-        
         if "history" in example:
             hist = example["history"]
             if isinstance(hist, list) and 0 in hist:
                 hist = hist[:hist.index(0)]
-            eval_hists.append(hist)
         else:
-            eval_hists.append([])
+            hist = []
+        
+        if len(hist) < 5:
+            continue
+        
+        user_ids.append(example["user_id"])
+        eval_hists.append(hist)
         
         if "target_items" in example:
             gt = example["target_items"]
@@ -910,7 +933,7 @@ def evaluate_pg_fusion(
         else:
             gt_items_list.append(set())
     
-    print(f"Processing {len(user_ids)} users with {K} recallers")
+    print(f"Processing {len(user_ids)} users with {K} recallers (filtered history < 5)")
     
     # Build user_candidates
     def recaller_wrapper(recaller_name):
@@ -938,6 +961,22 @@ def evaluate_pg_fusion(
         recallers=recaller_fns,
         M=M
     )
+    
+    if min_thres > 0:
+        valid_indices = []
+        for u in range(len(user_ids)):
+            best_ndcg = max(
+                ndcg_at_k(user_candidates[u][k][:train_k], list(gt_items_list[u]), train_k)
+                for k in range(K)
+            )
+            if best_ndcg >= min_thres:
+                valid_indices.append(u)
+        n_before = len(user_ids)
+        user_ids = [user_ids[i] for i in valid_indices]
+        eval_hists = [eval_hists[i] for i in valid_indices]
+        gt_items_list = [gt_items_list[i] for i in valid_indices]
+        user_candidates = [user_candidates[i] for i in valid_indices]
+        print(f"Filtered to {len(user_ids)}/{n_before} users (min_thres={min_thres}, train_k={train_k})")
     
     # Evaluate individual recallers
     print("\n" + "="*60)
@@ -1185,6 +1224,13 @@ def parse_args():
     parser.add_argument('--num_train_users', type=int, default=None, help='Number of training users')
     parser.add_argument('--num_test_users', type=int, default=None, help='Number of test users')
     parser.add_argument('--device', type=str, default='cuda', help='Device to run on')
+    parser.add_argument('--min_thres', type=float, default=0.001,
+                       help='Minimum best-recaller NDCG threshold for user filtering (matching main_pure.py).')
+    parser.add_argument('--train_k', type=int, default=20,
+                       help='Top-k for computing NDCG during filtering (matching main_pure.py train_k).')
+    parser.add_argument('--test_dataset_path', type=str, default=None,
+                       help='Path to main_pure pre-generated test dataset (HuggingFace Dataset). '
+                            'When provided, uses the exact same filtered users/history/gt as main_pure.')
     
     return parser.parse_args()
 
@@ -1259,17 +1305,38 @@ def main():
         learning_rate=args.learning_rate,
         reg_weight=args.reg_weight,
         embedding_dim=args.embedding_dim,
-        device=device
+        device=device,
+        min_thres=args.min_thres,
+        train_k=args.train_k,
     )
     
     # Create test dataset
     print("\n5. Creating test dataset...")
-    test_dataset = create_dataset_from_inter_dataset(
-        inter_dataset, 
-        split='test',
-        num_users=args.num_test_users
-    )
-    print(f"   Created test dataset with {len(test_dataset)} users")
+    if args.test_dataset_path:
+        from datasets import Dataset as HFDataset
+        hf_test = HFDataset.load_from_disk(args.test_dataset_path)
+        test_dataset = []
+        for ex in hf_test:
+            hist = ex["history"]
+            if isinstance(hist, list) and 0 in hist:
+                hist = hist[:hist.index(0)]
+            gt = ex["target_items"]
+            if isinstance(gt, int):
+                gt = [gt]
+            test_dataset.append({
+                "user_id": ex["user_id"],
+                "history": hist,
+                "target_items": gt,
+                "full_hist": ex.get("full_hist", hist),
+            })
+        print(f"   Loaded pre-generated test dataset from {args.test_dataset_path}: {len(test_dataset)} users")
+    else:
+        test_dataset = create_dataset_from_inter_dataset(
+            inter_dataset, 
+            split='test',
+            num_users=args.num_test_users
+        )
+        print(f"   Created test dataset with {len(test_dataset)} users")
     
     # Evaluate on test set
     print("\n6. Evaluating on test set...")
@@ -1279,7 +1346,9 @@ def main():
         recaller_names=recaller_names,
         pg_model=pg_model,
         final_k=args.final_k,
-        device=device
+        device=device,
+        min_thres=args.min_thres,
+        train_k=args.train_k,
     )
     
     # Save results

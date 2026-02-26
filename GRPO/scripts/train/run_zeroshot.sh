@@ -17,7 +17,7 @@ python GRPO/models/main_zeroshot.py \
     --dataset "$DATASET" \
     --data_path dataset \
     --checkpoint_dir ./checkpoints \
-    --model_name meta-llama/Llama-3.2-1B-Instruct \
+    --model_name Qwen/Qwen3-4B-Instruct-2507 \
     --recbole_models itemknn lightgcn pop \
     --eval_k 50 \
     --profile_cutoff 20 \

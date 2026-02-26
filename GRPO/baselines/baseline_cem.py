@@ -10,7 +10,7 @@ import argparse
 import json
 import os
 import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import torch
 from datetime import datetime
@@ -39,6 +39,8 @@ def optimize_cem_weights(
     cem_population: int = 256,
     cem_elite_frac: float = 0.1,
     device: str = "cuda",
+    min_thres: float = 0.001,
+    train_k: int = 20,
 ):
     """
     Optimize fusion weights using CEM on training/validation set.
@@ -128,6 +130,23 @@ def optimize_cem_weights(
         M=M
     )
     
+    if min_thres > 0:
+        valid_indices = []
+        for u in range(len(user_ids)):
+            best_ndcg = max(
+                ndcg_at_k(user_candidates[u][k][:train_k], list(gt_items_list[u]), train_k)
+                for k in range(K)
+            )
+            if best_ndcg >= min_thres:
+                valid_indices.append(u)
+        n_before = len(user_ids)
+        user_ids = [user_ids[i] for i in valid_indices]
+        eval_hists = [eval_hists[i] for i in valid_indices]
+        gt_items_list = [gt_items_list[i] for i in valid_indices]
+        full_hists = [full_hists[i] for i in valid_indices]
+        user_candidates = [user_candidates[i] for i in valid_indices]
+        print(f"Filtered to {len(user_ids)}/{n_before} users (min_thres={min_thres}, train_k={train_k})")
+    
     # Evaluate individual recallers on training set
     print("\n" + "="*60)
     print("Individual Recaller Performance (Training Set)")
@@ -182,6 +201,8 @@ def evaluate_cem_fusion(
     weights: torch.Tensor,
     final_k: int = 50,
     device: str = "cuda",
+    min_thres: float = 0.001,
+    train_k: int = 20,
 ):
     """
     Evaluate CEM-optimized fusion weights on test set.
@@ -211,16 +232,19 @@ def evaluate_cem_fusion(
     full_hists = []
     
     for example in test_dataset:
-        user_ids.append(example["user_id"])
-        
         # Get evaluation history
         if "history" in example:
             hist = example["history"]
             if isinstance(hist, list) and 0 in hist:
                 hist = hist[:hist.index(0)]
-            eval_hists.append(hist)
         else:
-            eval_hists.append([])
+            hist = []
+        
+        if len(hist) < 5:
+            continue
+        
+        user_ids.append(example["user_id"])
+        eval_hists.append(hist)
         
         # Get ground truth items
         if "target_items" in example:
@@ -237,7 +261,7 @@ def evaluate_cem_fusion(
         else:
             full_hists.append(None)
     
-    print(f"Processing {len(user_ids)} users with {K} recallers")
+    print(f"Processing {len(user_ids)} users with {K} recallers (filtered history < 5)")
     
     # Build user_candidates: List[List[List[int]]]
     # user_candidates[u][k] = list of M items for user u from recaller k
@@ -269,6 +293,23 @@ def evaluate_cem_fusion(
         recallers=recaller_fns,
         M=M
     )
+    
+    if min_thres > 0:
+        valid_indices = []
+        for u in range(len(user_ids)):
+            best_ndcg = max(
+                ndcg_at_k(user_candidates[u][k][:train_k], list(gt_items_list[u]), train_k)
+                for k in range(K)
+            )
+            if best_ndcg >= min_thres:
+                valid_indices.append(u)
+        n_before = len(user_ids)
+        user_ids = [user_ids[i] for i in valid_indices]
+        eval_hists = [eval_hists[i] for i in valid_indices]
+        gt_items_list = [gt_items_list[i] for i in valid_indices]
+        full_hists = [full_hists[i] for i in valid_indices]
+        user_candidates = [user_candidates[i] for i in valid_indices]
+        print(f"Filtered to {len(user_ids)}/{n_before} users (min_thres={min_thres}, train_k={train_k})")
     
     print(f"Using optimized weights from training phase...")
     print(f"Weights:")
@@ -473,6 +514,13 @@ def parse_args():
     parser.add_argument('--num_train_users', type=int, default=None, help='Number of training users (None for all)')
     parser.add_argument('--num_test_users', type=int, default=None, help='Number of test users (None for all)')
     parser.add_argument('--device', type=str, default='cuda', help='Device to run CEM on')
+    parser.add_argument('--min_thres', type=float, default=0.001,
+                       help='Minimum best-recaller NDCG threshold for user filtering (matching main_pure.py).')
+    parser.add_argument('--train_k', type=int, default=20,
+                       help='Top-k for computing NDCG during filtering (matching main_pure.py train_k).')
+    parser.add_argument('--test_dataset_path', type=str, default=None,
+                       help='Path to main_pure pre-generated test dataset (HuggingFace Dataset). '
+                            'When provided, uses the exact same filtered users/history/gt as main_pure.')
     
     return parser.parse_args()
 
@@ -537,17 +585,38 @@ def main():
         cem_iters=args.cem_iters,
         cem_population=args.cem_population,
         cem_elite_frac=args.cem_elite_frac,
-        device=args.device if torch.cuda.is_available() else "cpu"
+        device=args.device if torch.cuda.is_available() else "cpu",
+        min_thres=args.min_thres,
+        train_k=args.train_k,
     )
     
     # Create test dataset
     print("\n5. Creating test dataset...")
-    test_dataset = create_dataset_from_inter_dataset(
-        inter_dataset, 
-        split='test',
-        num_users=args.num_test_users
-    )
-    print(f"   Created test dataset with {len(test_dataset)} users")
+    if args.test_dataset_path:
+        from datasets import Dataset as HFDataset
+        hf_test = HFDataset.load_from_disk(args.test_dataset_path)
+        test_dataset = []
+        for ex in hf_test:
+            hist = ex["history"]
+            if isinstance(hist, list) and 0 in hist:
+                hist = hist[:hist.index(0)]
+            gt = ex["target_items"]
+            if isinstance(gt, int):
+                gt = [gt]
+            test_dataset.append({
+                "user_id": ex["user_id"],
+                "history": hist,
+                "target_items": gt,
+                "full_hist": ex.get("full_hist", hist),
+            })
+        print(f"   Loaded pre-generated test dataset from {args.test_dataset_path}: {len(test_dataset)} users")
+    else:
+        test_dataset = create_dataset_from_inter_dataset(
+            inter_dataset, 
+            split='test',
+            num_users=args.num_test_users
+        )
+        print(f"   Created test dataset with {len(test_dataset)} users")
     
     # Evaluate on test set with optimized weights
     print("\n6. Evaluating on test set with optimized weights...")
@@ -557,7 +626,9 @@ def main():
         recaller_names=recaller_names,
         weights=optimized_weights,
         final_k=args.final_k,
-        device=args.device if torch.cuda.is_available() else "cpu"
+        device=args.device if torch.cuda.is_available() else "cpu",
+        min_thres=args.min_thres,
+        train_k=args.train_k,
     )
     
     # Save results

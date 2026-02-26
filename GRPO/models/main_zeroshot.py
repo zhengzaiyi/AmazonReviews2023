@@ -42,9 +42,13 @@ def parse_args():
     parser.add_argument('--profile_cutoff', type=int, default=20)
     parser.add_argument('--prompt_top_k', type=int, default=3)
     parser.add_argument('--max_new_tokens', type=int, default=32)
+    parser.add_argument('--max_length', type=int, default=11024, help='Max input sequence length for tokenization')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--bf16', action='store_true')
     parser.add_argument('--max_samples', type=int, default=None, help='Max samples to evaluate (for debugging)')
+    parser.add_argument('--test_dataset_path', type=str, default=None,
+                       help='Path to main_pure pre-generated test dataset (HuggingFace Dataset). '
+                            'Skips create_sft_dataset and uses the exact same filtered users.')
     # Flags to match main_pure.py interface (used by create_sft_dataset)
     parser.add_argument('--use_soft_label', action='store_true', default=False)
     parser.add_argument('--soft_label_temperature', type=float, default=5.0)
@@ -78,6 +82,7 @@ def evaluate_zeroshot(
     id2label: Dict[int, str],
     eval_k: int = 50,
     max_new_tokens: int = 32,
+    max_length: int = 11024,
 ):
     """Zero-shot evaluation: generate recaller name and compute metrics"""
     device = model.device
@@ -87,7 +92,7 @@ def evaluate_zeroshot(
     all_labels = []
     recommendation_results = []
     raw_responses = []
-    
+    max_token_number = 0
     with torch.no_grad():
         for idx, example in enumerate(tqdm(test_dataset, desc="Zero-shot Evaluation")):
             prompt = example["text"]
@@ -101,7 +106,8 @@ def evaluate_zeroshot(
                 tokenize=False, 
                 add_generation_prompt=True
             )
-            inputs = tokenizer(chat_text, return_tensors="pt", truncation=True, max_length=2048)
+            max_token_number = max(max_token_number, tokenizer(chat_text, return_tensors="pt").input_ids.shape[1])
+            inputs = tokenizer(chat_text, return_tensors="pt", truncation=True, max_length=max_length)
             inputs = {k: v.to(device) for k, v in inputs.items()}
             
             outputs = model.generate(
@@ -141,33 +147,32 @@ def evaluate_zeroshot(
             if pred_recaller:
                 pred_items = pred_recaller.recall(user_id, eval_k, eval_hist, full_hist=full_hist, gt_items=gt_items)
                 pred_item_ids = [item[0] for item in pred_items] if pred_items else []
-                pred_ndcg = ndcg_at_k(pred_item_ids, gt_items, k=eval_k)
-                pred_recall = recall_at_k(pred_item_ids, gt_items, k=eval_k)
             else:
-                pred_item_ids, pred_ndcg, pred_recall = [], 0.0, 0.0
+                pred_item_ids = []
             
             # Generate recommendations using true recaller
             true_recaller = recallers.get(true_recaller_name)
             if true_recaller:
                 true_items = true_recaller.recall(user_id, eval_k, eval_hist, full_hist=full_hist, gt_items=gt_items)
                 true_item_ids = [item[0] for item in true_items] if true_items else []
-                true_ndcg = ndcg_at_k(true_item_ids, gt_items, k=eval_k)
-                true_recall = recall_at_k(true_item_ids, gt_items, k=eval_k)
             else:
-                true_item_ids, true_ndcg, true_recall = [], 0.0, 0.0
+                true_item_ids = []
             
-            recommendation_results.append({
+            # Compute metrics at multiple k values
+            rec_result = {
                 "user_id": user_id,
                 "predicted_recaller": predicted_recaller_name,
                 "true_recaller": true_recaller_name,
                 "raw_response": response,
-                "predicted_ndcg": pred_ndcg,
-                "true_ndcg": true_ndcg,
-                "predicted_recall": pred_recall,
-                "true_recall": true_recall,
                 "correct_prediction": predicted_recaller_name == true_recaller_name,
                 "history_length": len(eval_hist),
-            })
+            }
+            for k in [10, 20, 50]:
+                rec_result[f"pred_ndcg@{k}"] = ndcg_at_k(pred_item_ids, gt_items, k=k)
+                rec_result[f"pred_recall@{k}"] = recall_at_k(pred_item_ids, gt_items, k=k)
+                rec_result[f"true_ndcg@{k}"] = ndcg_at_k(true_item_ids, gt_items, k=k)
+                rec_result[f"true_recall@{k}"] = recall_at_k(true_item_ids, gt_items, k=k)
+            recommendation_results.append(rec_result)
     
     # Compute classification metrics (only on valid predictions)
     all_predictions = np.array(all_predictions)
@@ -208,22 +213,27 @@ def evaluate_zeroshot(
     
     # Recommendation metrics
     if recommendation_results:
-        avg_pred_ndcg = np.mean([r["predicted_ndcg"] for r in recommendation_results])
-        avg_true_ndcg = np.mean([r["true_ndcg"] for r in recommendation_results])
-        avg_pred_recall = np.mean([r["predicted_recall"] for r in recommendation_results])
-        avg_true_recall = np.mean([r["true_recall"] for r in recommendation_results])
         correct = sum([r["correct_prediction"] for r in recommendation_results])
         
-        print(f"\nRecommendation @{eval_k}: Pred NDCG={avg_pred_ndcg:.4f} Recall={avg_pred_recall:.4f}")
-        print(f"                     TrueBest NDCG={avg_true_ndcg:.4f} Recall={avg_true_recall:.4f}")
-        print(f"                     Acc={correct/len(recommendation_results):.2%} ({correct}/{len(recommendation_results)})")
+        # Aggregate metrics at multiple k values
+        zeroshot_metrics = {}
+        for k in [10, 20, 50]:
+            zeroshot_metrics[f"pred_ndcg@{k}"] = np.mean([r[f"pred_ndcg@{k}"] for r in recommendation_results])
+            zeroshot_metrics[f"pred_recall@{k}"] = np.mean([r[f"pred_recall@{k}"] for r in recommendation_results])
+            zeroshot_metrics[f"true_ndcg@{k}"] = np.mean([r[f"true_ndcg@{k}"] for r in recommendation_results])
+            zeroshot_metrics[f"true_recall@{k}"] = np.mean([r[f"true_recall@{k}"] for r in recommendation_results])
+        
+        print(f"\nZero-shot Recommendation Performance:")
+        print(f"{'Metric':<15} {'Predicted':>10} {'TrueBest':>10}")
+        print("-" * 37)
+        for k in [10, 20, 50]:
+            print(f"ndcg@{k:<10} {zeroshot_metrics[f'pred_ndcg@{k}']:>10.4f} {zeroshot_metrics[f'true_ndcg@{k}']:>10.4f}")
+            print(f"recall@{k:<8} {zeroshot_metrics[f'pred_recall@{k}']:>10.4f} {zeroshot_metrics[f'true_recall@{k}']:>10.4f}")
+        print(f"\nSelection Accuracy: {correct/len(recommendation_results):.2%} ({correct}/{len(recommendation_results)})")
         
         result.update({
             "recommendation_results": recommendation_results,
-            "avg_predicted_ndcg": avg_pred_ndcg,
-            "avg_true_ndcg": avg_true_ndcg,
-            "avg_predicted_recall": avg_pred_recall,
-            "avg_true_recall": avg_true_recall,
+            "zeroshot_metrics": zeroshot_metrics,
             "recaller_prediction_accuracy": correct / len(recommendation_results),
         })
     
@@ -246,7 +256,6 @@ def main():
     
     # Load data and recallers
     inter_dataset = load_dataset(args.dataset, args.data_path, seed=args.seed)
-    profile_agent = UserProfileAgent(inter_dataset, args.dataset)
     recallers = initialize_recallers(
         model_names=args.recbole_models,
         dataset_name=args.dataset,
@@ -261,21 +270,26 @@ def main():
     label2id = {name: i for i, name in enumerate(recaller_names)}
     id2label = {i: name for name, i in label2id.items()}
     
-    # Create test dataset with instruction prompt
-    print("\nCreating test dataset with instruction prompts...")
-    test_dataset, _, _, _, _ = create_sft_dataset(
-        profile_agent,
-        inter_dataset.test_user_ids,
-        inter_dataset.test_histories,
-        inter_dataset.test_target_items,
-        recallers, args,
-        use_augmentation=False,
-        min_thres=0.001,
-        prompt_type='instruction',
-    )
-    
-    # if args.max_samples:
-    #     test_dataset = test_dataset.select(range(min(args.max_samples, len(test_dataset))))
+    # Load or create test dataset
+    if args.test_dataset_path and os.path.exists(args.test_dataset_path):
+        from datasets import Dataset as HFDataset
+        test_dataset = HFDataset.load_from_disk(args.test_dataset_path)
+        if args.max_samples:
+            test_dataset = test_dataset.select(range(min(args.max_samples, len(test_dataset))))
+        print(f"\nLoaded pre-generated test dataset from {args.test_dataset_path}: {len(test_dataset)} samples")
+    else:
+        print("\nCreating test dataset with instruction prompts...")
+        profile_agent = UserProfileAgent(inter_dataset, args.dataset)
+        test_dataset, _, _, _, _ = create_sft_dataset(
+            profile_agent,
+            inter_dataset.test_user_ids,
+            inter_dataset.test_histories,
+            inter_dataset.test_target_items,
+            recallers, args,
+            use_augmentation=False,
+            min_thres=0.001,
+            prompt_type='instruction',
+        )
     print(f"Test dataset: {len(test_dataset)} samples")
     
     # Load model
@@ -300,6 +314,7 @@ def main():
         label2id, id2label,
         eval_k=args.eval_k,
         max_new_tokens=args.max_new_tokens,
+        max_length=args.max_length,
     )
     
     # Baseline evaluation
@@ -310,6 +325,25 @@ def main():
         test_dataset, recallers, recaller_names, args.eval_k,
         save_predictions=False,
     )
+    
+    # Print comparison table: Zero-shot vs Baselines
+    print("\n" + "="*60)
+    print("Zero-shot vs Baselines Comparison")
+    print("="*60)
+    zs_metrics = results.get("zeroshot_metrics", {})
+    best_base = max(recaller_names, key=lambda r: baseline_results.get(r, {}).get("ndcg@50", 0))
+    
+    print(f"{'Metric':<12} {'Zero-shot':>10} {'Avg-SW':>10} {'BestBase':>10} {'Gap(ZS-Best)':>14}")
+    print("-" * 58)
+    for k in [10, 20, 50]:
+        for metric_type in ["ndcg", "recall"]:
+            metric_name = f"{metric_type}@{k}"
+            zs_val = zs_metrics.get(f"pred_{metric_name}", 0)
+            avg_val = baseline_results.get("avg_score_weight", {}).get(metric_name, 0)
+            best_val = baseline_results.get(best_base, {}).get(metric_name, 0)
+            gap = zs_val - best_val
+            gap_str = f"+{gap:.4f}" if gap >= 0 else f"{gap:.4f}"
+            print(f"{metric_name:<12} {zs_val:>10.4f} {avg_val:>10.4f} {best_val:>10.4f} {gap_str:>14}")
     
     # Save results
     model_name_short = args.model_name.split("/")[-1]
