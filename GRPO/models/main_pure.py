@@ -972,18 +972,24 @@ def get_paths(args):
     """Get standardized paths"""
     model_name = args.model_name.split('/')[-1]
     base = f"{args.output_dir}/{args.dataset}/{model_name}"
-    recbole_models = args.recbole_models
+    recbole_models = list(args.recbole_models)
     recbole_models.sort()
     recbole_models = '_'.join(recbole_models)
     # Determine training mode prefix
     mode_prefix = "ar_" if args.autoregressive else ""
+    # Include profile_cutoff / prompt_top_k in paths when they differ from defaults
+    prompt_top_k = getattr(args, 'prompt_top_k', 3)
+    pc_suffix = f"_pc{args.profile_cutoff}" if args.profile_cutoff != 20 else ""
+    ptk_suffix = f"_ptk{prompt_top_k}" if prompt_top_k != 3 else ""
+    param_suffix = f"{pc_suffix}{ptk_suffix}"
+    data_path = f"{base}_pure_sft_data_{recbole_models}_{args.profile_cutoff}{ptk_suffix}"
     return {
         "model_name": args.model_name,
-        "sft": f"{base}_pure_{mode_prefix}sft_{recbole_models}",
-        "ar_sft": f"{base}_pure_ar_sft_{recbole_models}",  # AR SFT path for pretraining
-        "data": f"{base}_pure_sft_data_{recbole_models}_{args.profile_cutoff}",
-        "grpo": f"{base}_pure_grpo_{recbole_models}",
-        "grpo_data": f"{base}_pure_grpo_data_{recbole_models}_{args.profile_cutoff}"
+        "sft": f"{base}_pure_{mode_prefix}sft_{recbole_models}{param_suffix}",
+        "ar_sft": f"{base}_pure_ar_sft_{recbole_models}{param_suffix}",
+        "data": data_path,
+        "grpo": f"{base}_pure_grpo_{recbole_models}{param_suffix}",
+        "grpo_data": f"{base}_pure_grpo_data_{recbole_models}_{args.profile_cutoff}{ptk_suffix}"
     }
 
 
@@ -1086,6 +1092,9 @@ def parse_args():
                         choices=['average', 'top_k'],
                         help='Method for merging recaller results in baseline evaluation. '
                              'Options: average (uniform weights), top_k (keep highest scores).')
+    parser.add_argument('--skip_sft_init', action='store_true',
+                        help='Skip loading SFT checkpoint for GRPO; initialize from base model instead. '
+                             'Used for w/o SFT ablation study.')
     
     return parser.parse_args()
 
@@ -1367,8 +1376,15 @@ def main():
         # Load label mapping
         label2id, id2label = load_label_mapping(f'{paths["data"]}/label_mapping.json')
         
-        # For non-AR mode: use AR SFT checkpoint as initialization if exists
+        # Determine GRPO init model: SFT checkpoint if available, else base model
         sft_model_path = paths["sft"]
+        skip_sft_init = getattr(args, 'skip_sft_init', False)
+        if skip_sft_init or not os.path.exists(sft_model_path):
+            grpo_init_path = args.model_name
+            print(f"[GRPO] Initializing from base model: {grpo_init_path}")
+        else:
+            grpo_init_path = sft_model_path
+            print(f"[GRPO] Initializing from SFT checkpoint: {grpo_init_path}")
         
         # Create a minimal args-like object for GRPO loading
         class GRPOArgs:
@@ -1379,7 +1395,7 @@ def main():
         
         grpo_args = GRPOArgs()
         model, tokenizer = load_model_and_tokenizer(
-            sft_model_path, grpo_args, label2id, id2label,
+            grpo_init_path, grpo_args, label2id, id2label,
             device_map="cuda"
         )
         model.config.pad_token_id = tokenizer.eos_token_id
@@ -1410,7 +1426,7 @@ def main():
         # Create reference model for KL penalty (override the default CausalLM ref_model)
         if args.beta > 0:
             ref_model = load_model_only(
-                sft_model_path, grpo_args, label2id, id2label, device_map="cuda"
+                grpo_init_path, grpo_args, label2id, id2label, device_map="cuda"
             )
             ref_model.config.pad_token_id = tokenizer.eos_token_id
             ref_model.eval()
@@ -1461,6 +1477,9 @@ def main():
         
         recaller_combo = "_".join(recaller_names)
         model_name_short = args.model_name.split("/")[-1]  # e.g. Qwen2.5-0.5B-Instruct
+        _ptk = getattr(args, 'prompt_top_k', 3)
+        _param_suffix = (f"_pc{args.profile_cutoff}" if args.profile_cutoff != 20 else "") + \
+                        (f"_ptk{_ptk}" if _ptk != 3 else "")
         os.makedirs("results", exist_ok=True)
         base_config = {
             "dataset": args.dataset,
@@ -1526,12 +1545,12 @@ def main():
             results["config"] = {**base_config, "model_name": args.model_name, "model_path": model_path}
             
             if "predictions" in multi_results:
-                pred_file = f"results/pure_predictions_{args.dataset}_{model_name_short}_{recaller_combo}_{test_name}.json"
+                pred_file = f"results/pure_predictions_{args.dataset}_{model_name_short}_{recaller_combo}_{test_name}{_param_suffix}.json"
                 with open(pred_file, "w") as f:
                     json.dump(multi_results.pop("predictions"), f)
                 print(f"Predictions saved to: {pred_file}")
             
-            result_file = f"results/pure_model_results_{args.dataset}_{model_name_short}_{recaller_combo}_{test_name}.json"
+            result_file = f"results/pure_model_results_{args.dataset}_{model_name_short}_{recaller_combo}_{test_name}{_param_suffix}.json"
             with open(result_file, "w") as f:
                 json.dump(results, f, indent=2)
             print(f"Model results saved to: {result_file}")

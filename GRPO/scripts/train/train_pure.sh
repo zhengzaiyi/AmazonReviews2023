@@ -40,7 +40,8 @@ models="${TRAIN_MODELS:-LightGCN ItemKNN Pop}"
 train_k=20
 eval_k=50
 model_name="${TRAIN_MODEL_NAME:-meta-llama/Llama-3.2-1B-Instruct}"
-profile_cutoff=500000
+profile_cutoff="${PARAM_PROFILE_CUTOFF:-500000}"
+prompt_top_k="${PARAM_PROMPT_TOP_K:-3}"
 
 echo "================================================"
 echo "Generating pure SFT data..."
@@ -59,6 +60,7 @@ CUDA_VISIBLE_DEVICES=$DATA_EVAL_GPU python GRPO/models/main_pure.py \
     --padding_side left \
     --random_history_selection \
     --profile_cutoff $profile_cutoff \
+    --prompt_top_k $prompt_top_k \
     --gen_sft_train \
     --gen_sft_eval \
     --autoregressive \
@@ -92,6 +94,7 @@ accelerate launch --config_file GRPO/configs/soft_acc.yaml \
     --padding_side left \
     --random_history_selection \
     --profile_cutoff $profile_cutoff \
+    --prompt_top_k $prompt_top_k \
     --autoregressive \
 
 echo "================================================"
@@ -123,6 +126,7 @@ accelerate launch --config_file GRPO/configs/soft_acc.yaml \
     --padding_side left \
     --random_history_selection \
     --profile_cutoff $profile_cutoff \
+    --prompt_top_k $prompt_top_k \
 
 
 echo "================================================"
@@ -156,7 +160,8 @@ accelerate launch --config_file GRPO/configs/soft_acc.yaml \
     --gradient_accumulation_steps 8 \
     --bf16 \
     --seed 42 \
-    --profile_cutoff $profile_cutoff
+    --profile_cutoff $profile_cutoff \
+    --prompt_top_k $prompt_top_k
 
 echo "================================================" 
 echo "Testing pure GRPO model..."
@@ -176,6 +181,7 @@ CUDA_VISIBLE_DEVICES=$DATA_EVAL_GPU python GRPO/models/main_pure.py \
     --padding_side left \
     --random_history_selection \
     --profile_cutoff $profile_cutoff \
+    --prompt_top_k $prompt_top_k \
     --merge_method top_k \
     --max_length $max_length \
 

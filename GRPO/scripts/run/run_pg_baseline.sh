@@ -29,7 +29,7 @@ REG_WEIGHT=0.01  # Small value to not dominate PG loss
 EMBEDDING_DIM=64
 DELTA_MAX=10.0
 EPSILON=1e-6
-NUM_SAMPLES=1
+NUM_SAMPLES=10
 TOP_K_CHANNEL_ITEMS=10
 
 # User limits (set to empty string for all users)

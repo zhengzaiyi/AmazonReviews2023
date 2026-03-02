@@ -1075,6 +1075,10 @@ def evaluate_pg_fusion(
             f"ndcg@{final_k}": avg_ndcg,
         },
         "avg_weights": {name: float(avg_weights[i]) for i, name in enumerate(recaller_names)},
+        "per_user_weights": {
+            int(user_ids[u]): {name: float(personalized_weights[u][i]) for i, name in enumerate(recaller_names)}
+            for u in range(len(user_ids))
+        },
         "individual_recallers": individual_results,
     }
     
