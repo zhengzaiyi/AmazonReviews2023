@@ -541,35 +541,138 @@ def plot_weight_comparison(
     print(f"\nWeight comparison plot saved to: {save_path}")
     plt.close()
 
+    # Save raw data
+    data_path = save_path.replace('.pdf', '_data.json')
+    raw_data = {
+        "recaller_names": recaller_names,
+        "methods": {name: w.tolist() if hasattr(w, 'tolist') else list(w) for name, w in methods.items()}
+    }
+    with open(data_path, 'w') as f:
+        json.dump(raw_data, f, indent=2)
+    print(f"Weight comparison data saved to: {data_path}")
+
 
 def plot_weight_distribution(
     predictions: List[dict],
     recaller_names: List[str],
+    pg_per_user_weights: Optional[dict] = None,
+    pg_weights: Optional[dict] = None,
     save_path: str = "results/case_study_weight_dist.pdf",
 ):
     """Violin/box plot showing per-user weight distribution for each recaller."""
     all_weights = np.array([p["merge_weights"] for p in predictions])
+    n = len(recaller_names)
 
-    fig, ax = plt.subplots(figsize=(8, 4))
-    parts = ax.violinplot(
-        [all_weights[:, i] for i in range(len(recaller_names))],
-        positions=range(len(recaller_names)),
-        showmeans=True,
-        showmedians=True,
-    )
-    for pc in parts['bodies']:
-        pc.set_alpha(0.6)
+    has_pg = pg_per_user_weights is not None or pg_weights is not None
+    pg_all_weights = None
+    if has_pg:
+        pg_rows = []
+        for p in predictions:
+            uid = p.get("user_id", "?")
+            pw = None
+            if pg_per_user_weights:
+                pw = pg_per_user_weights.get(str(uid)) or pg_per_user_weights.get(
+                    int(uid) if isinstance(uid, str) else uid
+                )
+            if pw is None and pg_weights:
+                pw = pg_weights
+            if pw:
+                pg_rows.append([pw.get(rn, 0) for rn in recaller_names])
+        if pg_rows:
+            pg_all_weights = np.array(pg_rows)
 
-    ax.set_xticks(range(len(recaller_names)))
+    if pg_all_weights is not None:
+        fig, ax = plt.subplots(figsize=(max(8, n * 2.2), 4))
+        width = 0.35
+        positions_ours = np.arange(n) - width / 2
+        positions_pg = np.arange(n) + width / 2
+
+        parts_ours = ax.violinplot(
+            [all_weights[:, i] for i in range(n)],
+            positions=positions_ours, widths=width,
+            showmeans=True, showmedians=True,
+        )
+        for pc in parts_ours['bodies']:
+            pc.set_facecolor('#2196F3')
+            pc.set_alpha(0.6)
+        for key in ('cmeans', 'cmedians', 'cmins', 'cmaxes', 'cbars'):
+            if key in parts_ours:
+                parts_ours[key].set_color('#1565C0')
+
+        parts_pg = ax.violinplot(
+            [pg_all_weights[:, i] for i in range(n)],
+            positions=positions_pg, widths=width,
+            showmeans=True, showmedians=True,
+        )
+        for pc in parts_pg['bodies']:
+            pc.set_facecolor('#4CAF50')
+            pc.set_alpha(0.6)
+        for key in ('cmeans', 'cmedians', 'cmins', 'cmaxes', 'cbars'):
+            if key in parts_pg:
+                parts_pg[key].set_color('#2E7D32')
+
+        from matplotlib.patches import Patch
+        ax.legend(
+            handles=[Patch(facecolor='#2196F3', alpha=0.6, label='Ours (GRPO)'),
+                     Patch(facecolor='#4CAF50', alpha=0.6, label='PG')],
+            loc='upper right',
+        )
+        ax.set_title("Per-User Fusion Weight Distribution")
+    else:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        parts = ax.violinplot(
+            [all_weights[:, i] for i in range(n)],
+            positions=range(n),
+            showmeans=True, showmedians=True,
+        )
+        for pc in parts['bodies']:
+            pc.set_alpha(0.6)
+        ax.set_title("Per-User Fusion Weight Distribution (Ours)")
+
+    ax.set_xticks(range(n))
     ax.set_xticklabels(recaller_names)
     ax.set_ylabel("Fusion Weight")
-    ax.set_title("Per-User Fusion Weight Distribution (Ours)")
     ax.set_ylim(0, 1)
     plt.tight_layout()
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"Weight distribution plot saved to: {save_path}")
     plt.close()
+
+    # Save raw data
+    data_path = save_path.replace('.pdf', '_data.json')
+    raw_data = {
+        "recaller_names": recaller_names,
+        "num_users": len(predictions),
+        "ours": {
+            "per_user_weights": all_weights.tolist(),
+            "stats": {
+                rn: {
+                    "mean": float(all_weights[:, i].mean()),
+                    "std": float(all_weights[:, i].std()),
+                    "min": float(all_weights[:, i].min()),
+                    "max": float(all_weights[:, i].max()),
+                }
+                for i, rn in enumerate(recaller_names)
+            }
+        }
+    }
+    if pg_all_weights is not None:
+        raw_data["pg"] = {
+            "per_user_weights": pg_all_weights.tolist(),
+            "stats": {
+                rn: {
+                    "mean": float(pg_all_weights[:, i].mean()),
+                    "std": float(pg_all_weights[:, i].std()),
+                    "min": float(pg_all_weights[:, i].min()),
+                    "max": float(pg_all_weights[:, i].max()),
+                }
+                for i, rn in enumerate(recaller_names)
+            }
+        }
+    with open(data_path, 'w') as f:
+        json.dump(raw_data, f, indent=2)
+    print(f"Weight distribution data saved to: {data_path}")
 
 
 def plot_user_heatmap(
@@ -599,6 +702,24 @@ def plot_user_heatmap(
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"User heatmap saved to: {save_path}")
     plt.close()
+
+    # Save raw data
+    data_path = save_path.replace('.pdf', '_data.json')
+    raw_data = {
+        "recaller_names": recaller_names,
+        "user_labels": labels,
+        "weights_matrix": data.tolist(),
+        "users": {
+            label: {
+                "user_id": diverse_users[label].get("user_id"),
+                "weights": {rn: float(data[i, j]) for j, rn in enumerate(recaller_names)}
+            }
+            for i, label in enumerate(labels)
+        }
+    }
+    with open(data_path, 'w') as f:
+        json.dump(raw_data, f, indent=2)
+    print(f"User heatmap data saved to: {data_path}")
 
 
 def parse_args():
@@ -669,7 +790,7 @@ def main():
     cem_file = _find_file(args.cem_dir, "cem_results", dataset, combo)
     if cem_file:
         cem_data = load_cem_results(cem_file)
-        cem_weights = cem_data.get("cem_fusion", {}).get("optimized_weights", {})
+        cem_weights = {k.lower(): v for k, v in cem_data.get("cem_fusion", {}).get("optimized_weights", {}).items()}
         cem_metrics = cem_data.get("cem_fusion", {}).get("cem_optimized", {})
         print(f"Loaded CEM results from {cem_file}")
     else:
@@ -680,8 +801,9 @@ def main():
     pg_file = _find_file(args.pg_dir, "pg_results", dataset, combo)
     if pg_file:
         pg_data = load_pg_results(pg_file)
-        pg_weights = pg_data.get("pg_fusion", {}).get("avg_weights", {})
-        pg_per_user_weights = pg_data.get("pg_fusion", {}).get("per_user_weights", None)
+        pg_weights = {k.lower(): v for k, v in pg_data.get("pg_fusion", {}).get("avg_weights", {}).items()}
+        raw_puw = pg_data.get("pg_fusion", {}).get("per_user_weights", None)
+        pg_per_user_weights = {uid: {k.lower(): v for k, v in w.items()} for uid, w in raw_puw.items()} if raw_puw else None
         pg_metrics = pg_data.get("pg_fusion", {}).get("pg_optimized", {})
         print(f"Loaded PG results from {pg_file}"
               f" (per-user weights: {'yes' if pg_per_user_weights else 'no'})")
@@ -839,6 +961,8 @@ def main():
         )
         plot_weight_distribution(
             predictions, recaller_names,
+            pg_per_user_weights=pg_per_user_weights,
+            pg_weights=pg_weights,
             save_path=f"{prefix}_weight_distribution.pdf",
         )
         plot_user_heatmap(

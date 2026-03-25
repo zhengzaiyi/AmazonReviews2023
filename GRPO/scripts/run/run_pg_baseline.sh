@@ -40,7 +40,7 @@ NUM_TEST_USERS=""
 DEVICE="cuda"
 
 # Datasets to run
-DATASETS=("steam" "Food")
+DATASETS=("ml-1m")
 
 # Recaller combinations to test
 # Each combination is a space-separated list of models

@@ -280,7 +280,7 @@ def main():
     else:
         print("\nCreating test dataset with instruction prompts...")
         profile_agent = UserProfileAgent(inter_dataset, args.dataset)
-        test_dataset, _, _, _, _ = create_sft_dataset(
+        test_dataset, _, _, _, _, _ = create_sft_dataset(
             profile_agent,
             inter_dataset.test_user_ids,
             inter_dataset.test_histories,

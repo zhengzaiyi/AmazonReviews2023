@@ -116,7 +116,9 @@ def create_sft_dataset(
     recaller_names = sorted(list(recallers.keys()))
     label2id = {name: i for i, name in enumerate(recaller_names)}
     id2label = {i: name for name, i in label2id.items()}
-    max_token_number = 0
+    max_tokens_cls = 0
+    max_tokens_ar = 0
+    _has_chat_tpl = hasattr(tokenizer, 'apply_chat_template')
     for i, uid in tqdm(enumerate(user_ids)):
         hist = histories[i]
         gt_items = target_items[i]
@@ -216,7 +218,18 @@ def create_sft_dataset(
                 hint=hint if hint else None,
                 type=prompt_type
             )
-            max_token_number = max(max_token_number, tokenizer(prompt, return_tensors="pt").input_ids.shape[1])
+            if _has_chat_tpl:
+                _chat_text = tokenizer.apply_chat_template(
+                    [{"role": "assistant", "content": prompt}],
+                    tokenize=False, add_generation_prompt=False,
+                )
+            else:
+                _chat_text = prompt
+            _n_cls = len(tokenizer(_chat_text).input_ids)
+            _ar_text = _chat_text + f"\n\nBest recaller: {best_recaller}"
+            _n_ar = len(tokenizer(_ar_text).input_ids)
+            max_tokens_cls = max(max_tokens_cls, _n_cls)
+            max_tokens_ar = max(max_tokens_ar, _n_ar)
             sample = {
                 "text": prompt,
                 "prompt": prompt,  # For GRPO compatibility
@@ -269,7 +282,10 @@ def create_sft_dataset(
                 global_best_recaller = recaller_name
     print(f"Global best recaller (highest avg NDCG): {global_best_recaller} ({best_avg:.4f})")
     
-    return Dataset.from_list(dataset), label2id, id2label, user_best_recaller, global_best_recaller
+    token_stats = {"max_tokens_cls": max_tokens_cls, "max_tokens_ar": max_tokens_ar}
+    print(f"Max prompt tokens (after chat template): cls={max_tokens_cls}, ar={max_tokens_ar}")
+    
+    return Dataset.from_list(dataset), label2id, id2label, user_best_recaller, global_best_recaller, token_stats
 
 
 def compute_metrics(eval_pred):
@@ -968,6 +984,22 @@ def tokenize_function(examples, tokenizer, max_length=1536, autoregressive=False
         return tokenized
 
 
+def _save_token_stats(data_dir: str, split_name: str, token_stats: dict, num_samples: int):
+    """Save per-split token statistics and recompute global max across splits."""
+    meta_path = os.path.join(data_dir, "token_stats.json")
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            meta = json.load(f)
+    else:
+        meta = {"splits": {}}
+    meta["splits"][split_name] = {**token_stats, "num_samples": num_samples}
+    meta["max_tokens_cls"] = max(s["max_tokens_cls"] for s in meta["splits"].values())
+    meta["max_tokens_ar"] = max(s["max_tokens_ar"] for s in meta["splits"].values())
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"Token stats saved: {meta_path} (global max: cls={meta['max_tokens_cls']}, ar={meta['max_tokens_ar']})")
+
+
 def get_paths(args):
     """Get standardized paths"""
     model_name = args.model_name.split('/')[-1]
@@ -1173,7 +1205,7 @@ def main():
         print("="*60)
         print("Generating Eval dataset to get user hints...")
         print("="*60)
-        eval_dataset, label2id, id2label, eval_user_hint_map, eval_global_best = create_sft_dataset(
+        eval_dataset, label2id, id2label, eval_user_hint_map, eval_global_best, eval_token_stats = create_sft_dataset(
             profile_agent,
             inter_dataset.eval_user_ids,
             inter_dataset.eval_histories,
@@ -1184,6 +1216,7 @@ def main():
         )
         print(f"Collected hints for {len(eval_user_hint_map)} users from eval set")
         eval_dataset.save_to_disk(f'{paths["data"]}/eval')
+        _save_token_stats(paths["data"], "eval", eval_token_stats, len(eval_dataset))
         with open(label_mapping_path, 'w') as f:
             json.dump({"label2id": label2id, "id2label": id2label}, f, indent=2)
         with open(hint_map_path, 'w') as f:
@@ -1207,7 +1240,7 @@ def main():
         eval_user_hint_map = load_hint_map(hint_map_path)
         if eval_user_hint_map:
             print(f"Loaded eval hints for {len(eval_user_hint_map)} users")
-        train_dataset, _, _, _, _ = create_sft_dataset(
+        train_dataset, _, _, _, _, train_token_stats = create_sft_dataset(
             profile_agent, 
             inter_dataset.train_user_ids,
             inter_dataset.train_histories,
@@ -1218,6 +1251,7 @@ def main():
             min_thres=0.001,
         )
         train_dataset.save_to_disk(f'{paths["data"]}/train')
+        _save_token_stats(paths["data"], "train", train_token_stats, len(train_dataset))
         print(f"Saved Train dataset: {len(train_dataset)} samples")
     
     # Generate Test dataset (requires eval hints)
@@ -1229,7 +1263,7 @@ def main():
         eval_user_hint_map = load_hint_map(hint_map_path)
         if eval_user_hint_map:
             print(f"Loaded eval hints for {len(eval_user_hint_map)} users")
-        test_dataset, _, _, _, _ = create_sft_dataset(
+        test_dataset, _, _, _, _, test_token_stats = create_sft_dataset(
             profile_agent,
             inter_dataset.test_user_ids,
             inter_dataset.test_histories,
@@ -1241,10 +1275,21 @@ def main():
             min_thres=0.001,
         )
         test_dataset.save_to_disk(f'{paths["data"]}/test')
+        _save_token_stats(paths["data"], "test", test_token_stats, len(test_dataset))
         print(f"Saved Test dataset: {len(test_dataset)} samples")
     
     if args.gen_sft_train or args.gen_sft_eval or args.gen_sft_test:
         return
+    
+    # Load token stats to auto-set max_length
+    token_stats_path = os.path.join(paths["data"], "token_stats.json")
+    if os.path.exists(token_stats_path):
+        with open(token_stats_path) as f:
+            _ts = json.load(f)
+        _key = "max_tokens_ar" if args.autoregressive else "max_tokens_cls"
+        saved_max = _ts[_key]
+        print(f"[INFO] Loaded token stats from dataset: {_key}={saved_max} (cli max_length={args.max_length})")
+        args.max_length = saved_max
     
     # Train model
     if args.do_sft:
@@ -1462,7 +1507,7 @@ def main():
             test_dataset = Dataset.load_from_disk(f'{paths["data"]}/test')
             print(f"Loaded test dataset: {len(test_dataset)} samples")
         else:
-            test_dataset, _, _, _, _ = create_sft_dataset(
+            test_dataset, _, _, _, _, _ = create_sft_dataset(
                 profile_agent,
                 inter_dataset.test_user_ids,
                 inter_dataset.test_histories,

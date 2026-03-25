@@ -12,15 +12,15 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_SCRIPT="$SCRIPT_DIR/../train/train_pure.sh"
-SESSION_NAME="param_st_hl_large"
+SESSION_NAME="param_ptk_ml"
 
 # =============================================================================
 # Configuration
 # =============================================================================
 datasets=(
     # "Food"
-    "steam"
-    # "ml-1m"
+    # "steam"
+    "ml-1m"
 )
 
 combinations=(
@@ -33,24 +33,25 @@ model_names=(
 
 # Parameter study values
 history_lengths=(
+    # 0
     # 5 
     # 10 
     # 15
     20 
-    25 
-    50
+    # 25 
+    # 50
     # 500000
 )
 prompt_top_ks=(
     # 0 
-    # 1 
-    3 
-    # 5 
-    # 10
+    1 
+    # 3 
+    5 
+    10
 )
 
 # Which study to run: "history_length", "prompt_top_k", or "both"
-PARAM_TYPE="${PARAM_TYPE:-history_length}"
+PARAM_TYPE="${PARAM_TYPE:-prompt_top_k}"
 
 get_max_length() {
     case "$1" in
@@ -72,7 +73,7 @@ fi
 
 if [ "$PARAM_TYPE" = "prompt_top_k" ] || [ "$PARAM_TYPE" = "both" ]; then
     for ptk in "${prompt_top_ks[@]}"; do
-        param_configs+=("ptk_${ptk}:500000:${ptk}")
+        param_configs+=("ptk_${ptk}:20:${ptk}")
     done
 fi
 
@@ -109,7 +110,7 @@ for dataset in "${datasets[@]}"; do
         for model in "${model_names[@]}"; do
             for pc in "${param_configs[@]}"; do
                 IFS=':' read -r param_name cutoff ptk <<< "$pc"
-
+                sleep_num=$((counter * 28800 + 28800))
                 port=$((base_port + counter))
                 data_eval_gpu=$((counter % num_data_eval_gpus))
                 model_short=$(basename "$model")
@@ -123,7 +124,7 @@ for dataset in "${datasets[@]}"; do
 
                 tmux new-window -t "$SESSION_NAME" -n "$window_name"
                 tmux send-keys -t "$SESSION_NAME:$window_name" \
-                    "export TRAIN_MODELS='$combo' TRAIN_MODEL_NAME='$model' MASTER_PORT=$port DATA_EVAL_GPU=$data_eval_gpu MAX_LENGTH=$ml PARAM_PROFILE_CUTOFF=$cutoff PARAM_PROMPT_TOP_K=$ptk && source ~/.bashrc && conda activate pp && bash $TRAIN_SCRIPT $dataset" \
+                    "sleep 18000 && export TRAIN_MODELS='$combo' TRAIN_MODEL_NAME='$model' MASTER_PORT=$port DATA_EVAL_GPU=$data_eval_gpu MAX_LENGTH=$ml PARAM_PROFILE_CUTOFF=$cutoff PARAM_PROMPT_TOP_K=$ptk && source ~/.bashrc && conda activate pp && bash $TRAIN_SCRIPT $dataset" \
                     Enter
 
                 counter=$((counter + 1))
