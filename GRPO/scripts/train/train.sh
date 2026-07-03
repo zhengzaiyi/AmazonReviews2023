@@ -33,7 +33,7 @@ cd /data/sjc4fq/ColdRec/AmazonReviews2023
 #     --hf_model meta-llama/Llama-3.2-1B-Instruct
 
 PARALLEL_SIZE=1
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 # export CUDA_VISIBLE_DEVICES=4,5,6,7
 # echo "================================================"
 # echo "Running with SFT and RL"

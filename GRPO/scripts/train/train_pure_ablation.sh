@@ -8,7 +8,7 @@
 #   no_snack - Full pipeline but test with score merge (--merge_method average)
 # =============================================================================
 
-export PYTHONPATH=~/AmazonReviews2023
+export PYTHONPATH=/data/sjc4fq/ColdRec/AmazonReviews2023
 export TORCH_COMPILE_DISABLE=1
 export TORCHDYNAMO_DISABLE=1
 export WANDB_PROJECT="pure-grpo-ablation"
@@ -22,7 +22,7 @@ else
 fi
 
 PARALLEL_SIZE=1
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 DATA_EVAL_GPU="${DATA_EVAL_GPU:-4}"
 models="${TRAIN_MODELS:-LightGCN ItemKNN Pop}"
 train_k=20

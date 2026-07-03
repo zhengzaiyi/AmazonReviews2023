@@ -11,7 +11,7 @@ echo "CUDA_VISIBLE_DEVICES: $CUDA_DEVICE"
 echo "Dataset: $DATASET"
 
 CUDA_VISIBLE_DEVICES=$CUDA_DEVICE \
-PYTHONPATH=~/AmazonReviews2023 \
+PYTHONPATH=/data/sjc4fq/ColdRec/AmazonReviews2023 \
 WANDB_MODE=disabled \
 python GRPO/models/main_zeroshot.py \
     --dataset "$DATASET" \

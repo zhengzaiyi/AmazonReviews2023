@@ -12,10 +12,12 @@ SESSION_NAME="Food_re"
 # 在这里手动配置三个列表
 # =============================================================================
 datasets=(
-    # "ml-1m"
+    "ml-1m"
     # "steam"
     # "Amazon_Books"
-    "Food"
+    # "Food"
+    # "Amazon_Toys_and_Games"
+    # "Amazon_Video_Games"
 )
 
 combinations=(
@@ -28,7 +30,7 @@ combinations=(
 model_names=(
     "meta-llama/Llama-3.2-1B-Instruct"
     # "Qwen/Qwen2.5-0.5B-Instruct"
-    "Qwen/Qwen3-4B-Instruct-2507"
+    # "Qwen/Qwen3-4B-Instruct-2507"
 )
 
 get_max_length() {
@@ -80,7 +82,7 @@ for dataset in "${datasets[@]}"; do
 
             tmux new-window -t "$SESSION_NAME" -n "$window_name"
             tmux send-keys -t "$SESSION_NAME:$window_name" \
-                "export TRAIN_MODELS='$combo' TRAIN_MODEL_NAME='$model' MASTER_PORT=$port DATA_EVAL_GPU=$data_eval_gpu MAX_LENGTH=$ml && source ~/.bashrc && conda activate pp && p bash $TRAIN_SCRIPT $dataset" \
+                "export TRAIN_MODELS='$combo' TRAIN_MODEL_NAME='$model' MASTER_PORT=$port DATA_EVAL_GPU=$data_eval_gpu MAX_LENGTH=$ml && bash $TRAIN_SCRIPT $dataset" \
                 Enter
 
             counter=$((counter + 1))

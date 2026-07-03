@@ -26,8 +26,8 @@ export TORCHDYNAMO_DISABLE=1
 cd /data/sjc4fq/ColdRec/AmazonReviews2023
 
 PARALLEL_SIZE=1
-# export CUDA_VISIBLE_DEVICES=0,1,2,3
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+# export CUDA_VISIBLE_DEVICES=4,5,6,7
 
 # echo "================================================"
 # echo "Running Soft Token Training: Generate SFT Data"

@@ -1025,6 +1025,19 @@ def get_paths(args):
     }
 
 
+def resolve_test_checkpoint(model_base_path: str) -> Optional[str]:
+    """Return a loadable checkpoint path, or None when the saved checkpoint is missing/incomplete."""
+    if not os.path.exists(model_base_path):
+        return None
+    if os.path.exists(os.path.join(model_base_path, "config.json")):
+        return model_base_path
+    last_checkpoint = get_last_checkpoint(model_base_path)
+    if last_checkpoint and os.path.exists(os.path.join(last_checkpoint, "config.json")):
+        print(f"Loading from last checkpoint: {last_checkpoint}")
+        return last_checkpoint
+    return None
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Pure Text SFT Training for Model Selection')
     # Data
@@ -1046,6 +1059,8 @@ def parse_args():
                         help='Run baseline tests (recallers and avg) separately from model testing')
     # Training
     parser.add_argument('--per_device_train_batch_size', type=int, default=4)
+    parser.add_argument('--per_device_eval_batch_size', type=int, default=None,
+                        help='Eval batch size per device. Defaults to 1 for AR and 2 for classification SFT.')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
     parser.add_argument('--learning_rate', type=float, default=1e-5)
     parser.add_argument('--num_train_epochs', type=int, default=3)
@@ -1152,33 +1167,6 @@ def main():
     recaller_names = [name.lower() for name in recaller_names]
     
 
-    grpo_config = GRPOConfig(
-        output_dir=paths["grpo"],
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        per_device_eval_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        num_train_epochs=args.grpo_epochs,
-        learning_rate=args.grpo_lr,
-        warmup_steps=args.warmup_steps,
-        lr_scheduler_type="constant",
-        logging_steps=args.logging_steps,
-        save_steps=args.save_steps,
-        eval_strategy="steps",
-        eval_steps=1000,
-        save_total_limit=1,
-        bf16=args.bf16,
-        fp16=args.fp16 and not args.bf16,
-        # num_generations=2,
-        num_generations=args.num_generations,
-        epsilon=args.epsilon,
-        beta=args.beta,
-        sync_ref_model=args.sync_ref_model,
-        ref_model_sync_steps=args.ref_model_sync_steps,
-        scale_rewards="group",
-        report_to="wandb",
-        run_name=paths["grpo"] + "_" + datetime.now().strftime("%Y%m%d_%H%M%S"),
-        seed=args.seed,
-    )
     # Initialize components if needed
     if args.gen_sft_train or args.gen_sft_eval or args.gen_sft_test or args.do_test_sft or args.do_test_grpo or args.test_baseline:
         inter_dataset = load_dataset(
@@ -1281,15 +1269,19 @@ def main():
     if args.gen_sft_train or args.gen_sft_eval or args.gen_sft_test:
         return
     
-    # Load token stats to auto-set max_length
+    # Load token stats to avoid over-padding beyond the saved data, while still honoring CLI caps.
     token_stats_path = os.path.join(paths["data"], "token_stats.json")
     if os.path.exists(token_stats_path):
         with open(token_stats_path) as f:
             _ts = json.load(f)
         _key = "max_tokens_ar" if args.autoregressive else "max_tokens_cls"
-        saved_max = _ts[_key]
-        print(f"[INFO] Loaded token stats from dataset: {_key}={saved_max} (cli max_length={args.max_length})")
-        args.max_length = saved_max
+        saved_max = int(_ts[_key])
+        cli_max = int(args.max_length)
+        args.max_length = min(cli_max, saved_max)
+        print(
+            f"[INFO] Loaded token stats from dataset: {_key}={saved_max}; "
+            f"cli max_length={cli_max}; using max_length={args.max_length}"
+        )
     
     # Train model
     if args.do_sft:
@@ -1355,8 +1347,8 @@ def main():
         # Use SoftLabelTrainer if soft labels are enabled or using Dirichlet head
         use_soft_trainer = args.use_soft_label or args.use_dirichlet_head
         TrainerClass = SoftLabelTrainer if use_soft_trainer else Trainer
-        # For autoregressive: use smaller eval batch and only compute loss (logits are huge)
-        eval_batch_size = 1 if args.autoregressive else 2
+        # For autoregressive: use smaller eval batch and only compute loss (logits are huge).
+        eval_batch_size = args.per_device_eval_batch_size or (1 if args.autoregressive else 2)
         trainer = TrainerClass(
             model=model,
             args=TrainingArguments(
@@ -1404,6 +1396,43 @@ def main():
         print("\n" + "="*60)
         print("Starting Pure GRPO Training")
         print("="*60)
+
+        grpo_eval_batch_size = args.per_device_eval_batch_size or args.per_device_train_batch_size
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        global_grpo_eval_batch_size = grpo_eval_batch_size * world_size
+        if global_grpo_eval_batch_size % args.num_generations != 0:
+            adjusted_global = math.ceil(global_grpo_eval_batch_size / args.num_generations) * args.num_generations
+            grpo_eval_batch_size = max(1, math.ceil(adjusted_global / world_size))
+            print(
+                "[GRPO] Adjusted per_device_eval_batch_size to "
+                f"{grpo_eval_batch_size} so global eval batch is divisible by num_generations={args.num_generations}."
+            )
+        grpo_config = GRPOConfig(
+            output_dir=paths["grpo"],
+            per_device_train_batch_size=args.per_device_train_batch_size,
+            per_device_eval_batch_size=grpo_eval_batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            num_train_epochs=args.grpo_epochs,
+            learning_rate=args.grpo_lr,
+            warmup_steps=args.warmup_steps,
+            lr_scheduler_type="constant",
+            logging_steps=args.logging_steps,
+            save_steps=args.save_steps,
+            eval_strategy="steps",
+            eval_steps=1000,
+            save_total_limit=1,
+            bf16=args.bf16,
+            fp16=args.fp16 and not args.bf16,
+            num_generations=args.num_generations,
+            epsilon=args.epsilon,
+            beta=args.beta,
+            sync_ref_model=args.sync_ref_model,
+            ref_model_sync_steps=args.ref_model_sync_steps,
+            scale_rewards="group",
+            report_to="wandb",
+            run_name=paths["grpo"] + "_" + datetime.now().strftime("%Y%m%d_%H%M%S"),
+            seed=args.seed,
+        )
         
         # Initialize recallers if not already done (only needed when running --do_grpo alone)
         if 'recallers' not in dir() or recallers is None:
@@ -1556,15 +1585,13 @@ def main():
             print(f"MODEL TESTING: {test_name.upper()}")
             print("="*60)
             
-            # Resolve model path
-            model_path = model_base_path if os.path.exists(model_base_path) else args.model_name
-            if os.path.exists(model_path) and not os.path.exists(os.path.join(model_path, "config.json")):
-                last_checkpoint = get_last_checkpoint(model_path)
-                if last_checkpoint:
-                    model_path = last_checkpoint
-                    print(f"Loading from last checkpoint: {model_path}")
-                else:
-                    print(f"Warning: No checkpoint found in {model_path}")
+            model_path = resolve_test_checkpoint(model_base_path)
+            if model_path is None:
+                print(
+                    f"[skip] No loadable {test_name.upper()} checkpoint found at {model_base_path}. "
+                    "Run the corresponding training stage first, or disable this test flag."
+                )
+                continue
             
             model, tokenizer = load_model_and_tokenizer(
                 model_path, args, label2id=label2id, id2label=id2label
@@ -1607,6 +1634,8 @@ def main():
         # Print cross-checkpoint comparison table
         if len(all_multi_results) > 1:
             print_cross_checkpoint_table(all_multi_results, recaller_names)
+        elif test_configs and not all_multi_results:
+            print("[warn] No checkpoint evaluation was run because all requested checkpoints were missing/incomplete.")
         
         # Baseline testing
         if args.test_baseline:

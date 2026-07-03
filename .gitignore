@@ -181,4 +181,6 @@ soft_models/
 *.txt
 pure_models/
 checkpoints_test/
+tmp*/
+torch*/
 

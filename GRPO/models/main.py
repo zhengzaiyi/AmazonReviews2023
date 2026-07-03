@@ -3,7 +3,7 @@ import os
 import random
 import json
 import numpy as np
-from typing import List
+from typing import List, Optional
 
 from GRPO.core.utils import set_seed
 from GRPO.core.data import load_dataset
@@ -11,7 +11,26 @@ from GRPO.core.recallers import RecBoleRecaller
 from GRPO.core.agents import UserProfileAgent, LLMRouterAgent
 
 
-def create_recaller(model_name: str, dataset_name: str, checkpoint_dir: str, data_path: str, seed: int, use_latest_checkpoint: bool = True, num_items: int = 0) -> RecBoleRecaller:
+def recbole_gpu_id_from_device(device: Optional[str]) -> Optional[str]:
+    """Return the physical GPU id RecBole expects for CUDA_VISIBLE_DEVICES."""
+    if not device:
+        return None
+    if not str(device).startswith("cuda"):
+        return ""
+    parts = str(device).split(":", 1)
+    return parts[1] if len(parts) == 2 and parts[1] else "0"
+
+
+def create_recaller(
+    model_name: str,
+    dataset_name: str,
+    checkpoint_dir: str,
+    data_path: str,
+    seed: int,
+    use_latest_checkpoint: bool = True,
+    num_items: int = 0,
+    device: Optional[str] = None,
+) -> RecBoleRecaller:
     """Create a recaller with proper configuration for the specified model"""
     
     # Find checkpoint if requested
@@ -99,6 +118,11 @@ def create_recaller(model_name: str, dataset_name: str, checkpoint_dir: str, dat
     
     # Get configuration for the specific model
     config_dict = model_configs.get(model_name, {'seed': seed})
+    if device:
+        config_dict = {**config_dict, 'device': device}
+        gpu_id = recbole_gpu_id_from_device(device)
+        if gpu_id is not None:
+            config_dict['gpu_id'] = gpu_id
     
     # Create the recaller
     recaller = RecBoleRecaller(
@@ -114,7 +138,15 @@ def create_recaller(model_name: str, dataset_name: str, checkpoint_dir: str, dat
 
 
 def initialize_recallers(
-    model_names: List[str], dataset_name: str, checkpoint_dir: str, data_path: str, seed: int, use_latest_checkpoint: bool = True, num_items: int = 0) -> dict:
+    model_names: List[str],
+    dataset_name: str,
+    checkpoint_dir: str,
+    data_path: str,
+    seed: int,
+    use_latest_checkpoint: bool = True,
+    num_items: int = 0,
+    device: Optional[str] = None,
+) -> dict:
     """Initialize all recallers with proper error handling"""
     
     recallers = {}
@@ -147,7 +179,8 @@ def initialize_recallers(
             data_path=data_path,
             seed=seed,
             use_latest_checkpoint=use_latest_checkpoint,
-            num_items=num_items
+            num_items=num_items,
+            device=device,
         )
         
         recallers[model_name.lower()] = recaller
@@ -163,7 +196,8 @@ def initialize_recallers(
             data_path=data_path,
             seed=seed,
             use_latest_checkpoint=False,
-            num_items=num_items
+            num_items=num_items,
+            device=device,
         )
         recallers['pop'] = fallback_recaller
         print("✅ Fallback Pop recaller initialized")
